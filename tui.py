@@ -667,6 +667,18 @@ class ProgressScreen(Screen):
 
     def _run_processing(self) -> None:
         """在后台线程中执行完整的上传 → 轮询 → 下载流程。"""
+        try:
+            self._run_processing_inner()
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("[_run_processing] 未捕获异常，线程崩溃:\n%s", tb)
+            self._log_line(f"[致命错误] 内部异常，请查看 mineru_errors.log")
+            self._finished = True
+
+    def _run_processing_inner(self) -> None:
+        """实际处理逻辑，由 _run_processing 包裹异常捕获。"""
+        logger.debug("[_run_processing] 开始执行处理线程")
         from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
         from processor import download_results_concurrent
         from scanner import DuplicateAction, resolve_output_stem

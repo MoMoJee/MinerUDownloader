@@ -112,6 +112,7 @@ def _download_with_retry(
     """带指数退避重试的 HTTP GET 下载，返回 bytes。"""
     last_exc: Exception | None = None
     for attempt in range(retries):
+        logger.debug("[download] attempt=%d/%d url=%s", attempt + 1, retries, url[:80])
         try:
             resp = requests.get(url, proxies=proxies, timeout=HTTP_TIMEOUT, stream=True)
             resp.raise_for_status()

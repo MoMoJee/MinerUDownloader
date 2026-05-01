@@ -106,37 +106,55 @@ def scan(root: Path) -> DirNode:
     return node
 
 
+def _safe_is_file(p: Path) -> bool:
+    try:
+        return p.is_file()
+    except OSError:
+        return False
+
+
+def _safe_is_dir(p: Path) -> bool:
+    try:
+        return p.is_dir()
+    except OSError:
+        return False
+
+
 def _scan_dir(path: Path, root: Path) -> DirNode | None:
     """递归构建 DirNode；若目录内没有支持的文件则返回 None。"""
     rel = path.relative_to(root) if path != root else Path(".")
     node = DirNode(path=path, rel_path=rel)
 
     try:
-        entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        entries = sorted(path.iterdir(), key=lambda p: (_safe_is_file(p), p.name.lower()))
     except PermissionError:
         return None
 
     for entry in entries:
-        if entry.is_dir():
+        if _safe_is_dir(entry):
             if entry.name.startswith("."):
                 continue
             child = _scan_dir(entry, root)
             if child is not None:
                 node.children.append(child)
-        elif entry.is_file():
+        elif _safe_is_file(entry):
             if entry.suffix.lower() in SUPPORTED_EXTENSIONS:
                 file_node = _make_file_node(entry, root)
-                node.children.append(file_node)
+                if file_node is not None:
+                    node.children.append(file_node)
 
     if not node.children:
         return None
     return node
 
 
-def _make_file_node(path: Path, root: Path) -> FileNode:
-    """创建 FileNode，检测是否已有同名 .md。"""
+def _make_file_node(path: Path, root: Path) -> FileNode | None:
+    """创建 FileNode，检测是否已有同名 .md。失败（无法 stat）返回 None。"""
     rel = path.relative_to(root)
-    size = path.stat().st_size
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
     md_candidate = path.parent / (path.stem + ".md")
     existing_md = md_candidate if md_candidate.exists() else None
     dup_action = DuplicateAction.NONE if existing_md else DuplicateAction.NONE

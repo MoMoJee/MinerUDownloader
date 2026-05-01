@@ -191,3 +191,44 @@ MinerUDownloader/
 | `pyyaml >= 6.0.0` | 配置文件读写 |
 
 系统依赖：`curl.exe`（Windows 10 / 11 内置）
+
+---
+
+## 打包为 Windows 可执行文件
+
+项目提供 `mineru_downloader.spec`，可用 PyInstaller 打包为免安装 Python 的独立程序。
+
+### 步骤
+
+```bash
+# 1. 安装 PyInstaller（仅需一次）
+pip install pyinstaller
+
+# 2. 打包（首次）
+pyinstaller --clean -y mineru_downloader.spec
+
+# 重新打包（覆盖已有 dist）
+pyinstaller --clean -y mineru_downloader.spec
+```
+
+打包完成后，输出目录为 `dist\mineru-downloader\`，直接分发整个目录即可。
+
+### 使用打包版本
+
+```bash
+# 将 dist\mineru-downloader\ 复制到目标机器后：
+cd mineru-downloader
+.\mineru-downloader.exe D:\docs
+.\mineru-downloader.exe D:\docs --cli
+.\mineru-downloader.exe --help
+```
+
+> **注意**：打包版本仍依赖系统的 `curl.exe`（Windows 10 / 11 已内置）。`mineru_config.yaml` 会在 exe 所在目录生成，首次运行需配置 Token。
+
+### 输出说明
+
+| 路径 | 说明 |
+|------|------|
+| `dist\mineru-downloader\mineru-downloader.exe` | 主程序入口（约 6 MB）|
+| `dist\mineru-downloader\_internal\` | Python 运行时与依赖库 |
+| `build\` | 中间产物，可删除 |

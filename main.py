@@ -11,14 +11,65 @@ import shutil
 import sys
 from pathlib import Path
 
+# ── 双击启动检测（Windows） ────────────────────────────────────────────────────
+# 打包后双击 exe 时，Windows 会给它创建一个独占的控制台窗口（只有自身进程）。
+# 在已有终端中运行时，控制台由多个进程共享（count > 1）。
+# 检测到双击后，用 PowerShell 在 exe 父目录的上一级（用户存放文件的目录）打开新终端执行自身。
+def _relaunch_if_double_clicked() -> None:
+    if not getattr(sys, 'frozen', False):
+        return  # 仅打包版处理
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        # GetConsoleProcessList 返回共享当前控制台的进程数量
+        # 双击时 == 1（仅自身），从终端运行时 > 1
+        buf = (ctypes.c_ulong * 64)()
+        count = ctypes.windll.kernel32.GetConsoleProcessList(buf, 64)
+        if count != 1:
+            return  # 已在终端中，正常运行
+    except Exception:
+        return  # 获取失败则不干预
+
+    # 双击场景：exe 在 mineru-downloader/ 里，父目录才是用户的工作目录
+    exe_path = Path(sys.executable)
+    work_dir = exe_path.parent.parent  # mineru-downloader/ 的上一级
+
+    import subprocess
+    # 用 PowerShell 在工作目录打开新窗口，执行 exe
+    subprocess.Popen(
+        [
+            'powershell.exe',
+            '-NoLogo',
+            '-NoExit',
+            '-Command', (
+                f"Set-Location -LiteralPath '{work_dir}'; "
+                f"& '{exe_path}'; "
+                "Write-Host ''; "
+                "Write-Host ' 程序已结束，按任意键关闭...' -NoNewline; "
+                "$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')"
+            ),
+        ],
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+    sys.exit(0)
+
+_relaunch_if_double_clicked()
+
 from config import load_config, merge_cli_args, save_config
 from scanner import scan
 
 # ── 错误日志文件 ──────────────────────────────────────────────────────────────
-_LOG_FILE = Path(__file__).parent / "mineru_errors.log"
+# 打包后 exe 在 _internal/ 中，需用 sys.executable 定位日志到 exe 同级目录
+def _log_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+_LOG_FILE = _log_dir() / "mineru_errors.log"
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         logging.FileHandler(_LOG_FILE, encoding="utf-8", mode="a"),
@@ -28,6 +79,10 @@ logging.basicConfig(
 _console_handler = logging.StreamHandler(sys.stderr)
 _console_handler.setLevel(logging.WARNING)
 logging.getLogger().addHandler(_console_handler)
+# 抑制过于啰嗦的第三方库 DEBUG 日志
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("charset_normalizer").setLevel(logging.WARNING)
 
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
@@ -140,19 +195,34 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
+    _logger = logging.getLogger("main")
+    _logger.debug("=== 启动 MinerU Downloader ===")
+    _logger.debug("sys.frozen=%s  sys.executable=%s", getattr(__import__('sys'), 'frozen', False), sys.executable)
+    _logger.debug("__file__=%s", __file__)
+    _logger.debug("args=%s", args)
+
     # 1. 检查前置依赖
     _check_prerequisites()
 
     # 2. 加载 YAML 配置，用命令行参数覆盖
     cfg = load_config()
+    _logger.debug("CONFIG_FILE=%s", __import__('config').CONFIG_FILE)
+    _logger.debug("cfg (after load_config)= token_count=%s lb=%s language=%s proxy=%s",
+                  len(__import__('token_manager').TokenManager.parse_tokens(cfg.get('token', ''))),
+                  cfg.get('lb_enabled'), cfg.get('language'), cfg.get('proxy_mode'))
 
     # Token 优先级：yaml < 环境变量 < --token 参数（TUI/CLI 内部输入优先级最高，在各自模块中处理）
     # 若 yaml 没有 token 且环境变量有，则用环境变量
     if not cfg.get("token") and os.environ.get("MINERU_TOKEN"):
         cfg["token"] = os.environ["MINERU_TOKEN"]
+        _logger.debug("cfg: token 来自环境变量 MINERU_TOKEN（已脱敏：%s...）",
+                      os.environ["MINERU_TOKEN"][:8])
 
     # merge_cli_args 会将 --token 参数（若存在）写入 cfg["token"]，完全替换低优先级来源
     cfg = merge_cli_args(cfg, args)
+    _logger.debug("cfg (after merge_cli_args)= token_count=%s lb=%s",
+                  len(__import__('token_manager').TokenManager.parse_tokens(cfg.get('token', ''))),
+                  cfg.get('lb_enabled'))
 
     # batch_size 合法性检查
     bs = cfg.get("batch_size", 20)

@@ -7,10 +7,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import sys
+
 import yaml
 
 # ── 路径 ────────────────────────────────────────────────────────────────────
-_SCRIPT_DIR = Path(__file__).parent
+# 打包为 PyInstaller exe 时，__file__ 位于 _internal/，需用 exe 所在目录；
+# 直接运行 .py 时使用脚本目录。
+def _config_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包：sys.executable 是 .exe 路径
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+_SCRIPT_DIR = _config_dir()
 CONFIG_FILE = _SCRIPT_DIR / "mineru_config.yaml"
 
 # ── API 常量 ─────────────────────────────────────────────────────────────────

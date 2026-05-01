@@ -68,6 +68,8 @@ def apply_upload_urls(
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        logger.debug("[apply_upload_urls] 尝试 Token[%d] token_prefix=%s... 文件数=%d",
+                     token_idx, token[:8] if len(token) > 8 else token, len(files))
         try:
             resp = requests.post(
                 BATCH_URL,
@@ -78,6 +80,8 @@ def apply_upload_urls(
             )
         except requests.RequestException as exc:
             raise RuntimeError(f"申请上传 URL 网络错误: {exc}") from exc
+
+        logger.debug("[apply_upload_urls] Token[%d] HTTP %d", token_idx, resp.status_code)
 
         # HTTP 401 / 429 → 标记 Token 并切换重试（不当作致命网络错误）
         if resp.status_code == 401:
@@ -108,6 +112,9 @@ def apply_upload_urls(
 
         # used_batches 已在 get_token() 内部递增，此处不重复计数
         batch_id: str = data["data"]["batch_id"]
+        upload_urls: list[str] = data["data"]["file_urls"]
+        logger.debug("[apply_upload_urls] 成功 batch_id=%s url_count=%d Token[%d]",
+                     batch_id, len(upload_urls), token_idx)
         upload_urls: list[str] = data["data"]["file_urls"]
         logger.debug("申请到 batch_id=%s，共 %d 个上传 URL（Token[%d]）",
                      batch_id, len(upload_urls), token_idx)
