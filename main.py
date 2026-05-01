@@ -146,10 +146,12 @@ def main() -> None:
     # 2. 加载 YAML 配置，用命令行参数覆盖
     cfg = load_config()
 
-    # Token 环境变量
+    # Token 优先级：yaml < 环境变量 < --token 参数（TUI/CLI 内部输入优先级最高，在各自模块中处理）
+    # 若 yaml 没有 token 且环境变量有，则用环境变量
     if not cfg.get("token") and os.environ.get("MINERU_TOKEN"):
         cfg["token"] = os.environ["MINERU_TOKEN"]
 
+    # merge_cli_args 会将 --token 参数（若存在）写入 cfg["token"]，完全替换低优先级来源
     cfg = merge_cli_args(cfg, args)
 
     # batch_size 合法性检查

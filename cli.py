@@ -32,6 +32,7 @@ from scanner import (
     resolve_output_stem,
 )
 from config import build_proxies, save_config
+from token_manager import TokenManager
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -231,10 +232,17 @@ def _phase_options(cfg: dict) -> dict:
     console.print()
     console.rule("[bold cyan]解析选项[/bold cyan]")
 
-    token_display = (
-        f"{cfg['token'][:6]}...{cfg['token'][-4:]}" if len(cfg.get("token", "")) > 10 else
-        ("(已配置)" if cfg.get("token") else "[red](未配置)[/red]")
-    )
+    token_raw = cfg.get("token", "")
+    if isinstance(token_raw, list):
+        token_raw = ",".join(token_raw)
+    tokens = TokenManager.parse_tokens(token_raw)
+    if len(tokens) > 1:
+        token_display = f"{len(tokens)} 个 Token"
+    elif tokens:
+        t0 = tokens[0]
+        token_display = f"{t0[:6]}...{t0[-4:]}" if len(t0) > 10 else "(已配置)"
+    else:
+        token_display = "[red](未配置)[/red]"
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="bold", width=14)
     table.add_column()
@@ -245,22 +253,29 @@ def _phase_options(cfg: dict) -> dict:
     table.add_row("代理地址", cfg.get("proxy_url", "") or "(无)")
     table.add_row("每批文件数", str(cfg.get("batch_size", 20)))
     table.add_row("Token", token_display)
+    table.add_row("负载均衡", "开" if cfg.get("lb_enabled") else "关（自动）")
     console.print(table)
 
     ans = _ask("\n是否修改任意选项？(y/N): ", "N").upper()
     if ans != "Y":
         # 若 Token 未配置则强制输入
-        if not cfg.get("token"):
-            cfg["token"] = _ask("请输入 MinerU Token: ")
+        if not TokenManager.parse_tokens(cfg.get("token", "")):
+            cfg["token"] = _ask("请输入 MinerU Token（多个用逗号分隔）: ")
         return cfg
 
     cfg = dict(cfg)
     console.print()
 
     # Token
-    t = _ask(f"  Token（回车保持当前）: ")
+    t = _ask(f"  Token（逗号分隔多个，回车保持当前）: ")
     if t:
         cfg["token"] = t
+    # 负载均衡
+    current_tokens = TokenManager.parse_tokens(cfg.get("token", ""))
+    if len(current_tokens) > 1:
+        lb_default = "Y" if cfg.get("lb_enabled", True) else "N"
+        lb = _ask(f"  启用负载均衡（当前: {'Y' if cfg.get('lb_enabled', True) else 'N'}）(Y/n): ", lb_default).upper()
+        cfg["lb_enabled"] = lb != "N"
 
     # 语言
     lang = _ask(f"  语言（当前: {cfg.get('language', 'ch')}，回车保持）: ")
@@ -291,8 +306,8 @@ def _phase_options(cfg: dict) -> dict:
         save_config(cfg)
         console.print("[green]配置已保存。[/green]")
 
-    if not cfg.get("token"):
-        cfg["token"] = _ask("请输入 MinerU Token（必填）: ")
+    if not TokenManager.parse_tokens(cfg.get("token", "")):
+        cfg["token"] = _ask("请输入 MinerU Token（必填，多个用逗号分隔）: ")
 
     return cfg
 
@@ -356,7 +371,14 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
     for fn in to_process:
         state.set(fn, "waiting", "等待中")
 
-    token = cfg["token"]
+    # 构建 TokenManager
+    tokens = TokenManager.parse_tokens(cfg.get("token", ""))
+    lb = cfg.get("lb_enabled")
+    if lb is None:
+        lb = len(tokens) > 1
+    token_manager = TokenManager(tokens, lb_enabled=bool(lb))
+    console.print(f"[dim]Token: {' | '.join(tm.display for tm in token_manager.entries)}[/dim]")
+
     proxies = build_proxies(cfg.get("proxy_mode", "system"), cfg.get("proxy_url", ""))
     proxy_mode = cfg.get("proxy_mode", "system")
     proxy_url = cfg.get("proxy_url", "")
@@ -379,6 +401,7 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
     state.log_line(f"共 {len(to_process)} 个文件，分 {len(batches)} 批")
 
     batch_node_map: dict[str, list[FileNode]] = {}
+    batch_token_idx: dict[str, int] = {}
     stem_map: dict[FileNode, str] = {}
 
     progress = Progress(
@@ -417,12 +440,13 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
                 progress.advance(upload_task)
 
             try:
-                bid, upload_results = submit_and_upload_batch(
-                    batch, token, "vlm", language, proxies,
+                bid, upload_results, token_idx = submit_and_upload_batch(
+                    batch, token_manager, "vlm", language, proxies,
                     proxy_mode, proxy_url, on_uploaded=_on_up
                 )
                 success_nodes = [fn for fn in batch if upload_results.get(fn.path, False)]
                 batch_node_map[bid] = success_nodes
+                batch_token_idx[bid] = token_idx
                 for fn in success_nodes:
                     state.set(fn, "parsing", "排队中")
             except Exception as exc:
@@ -460,8 +484,9 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
                     state.log_line(f"[失败] {fn.path.name}: {r.get('err_msg','')}")
                     progress.advance(parse_task)
 
+        batch_token_pairs = [(bid, batch_token_idx.get(bid, 0)) for bid in batch_node_map]
         poll_results = poll_batches_concurrent(
-            list(batch_node_map.keys()), token,
+            batch_token_pairs, token_manager,
             poll_interval, timeout, proxies, on_bp
         )
 

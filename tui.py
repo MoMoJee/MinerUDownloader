@@ -35,6 +35,7 @@ from textual.widgets.tree import TreeNode
 
 from scanner import DirNode, DuplicateAction, FileNode, flatten_files, resolve_output_stem, selected_files
 from config import load_config, save_config
+from token_manager import TokenManager
 
 logger = logging.getLogger(__name__)
 
@@ -176,12 +177,20 @@ class SelectScreen(Screen):
                 yield Tree("根目录", id="file-tree")
             with ScrollableContainer(id="options-panel"):
                 yield Label("⚙ 解析选项")
-                yield Label("MinerU Token")
+                yield Label("MinerU Token（多个用逗号分隔）")
+                raw_token = self._cfg.get("token", "")
+                if isinstance(raw_token, list):
+                    raw_token = ",".join(raw_token)
                 yield Input(
-                    value=self._cfg.get("token", ""),
+                    value=raw_token,
                     password=True,
-                    placeholder="sk-...",
+                    placeholder="sk-...（多个 Token 用逗号分隔）",
                     id="input-token",
+                )
+                yield Checkbox(
+                    "启用负载均衡（多 Token 轮询）",
+                    value=bool(self._cfg.get("lb_enabled", False)),
+                    id="cb-lb",
                 )
                 yield Label("文档语言")
                 lang_options = [
@@ -387,6 +396,7 @@ class SelectScreen(Screen):
         # 收集配置
         try:
             self._cfg["token"] = self.query_one("#input-token", Input).value.strip()
+            self._cfg["lb_enabled"] = self.query_one("#cb-lb", Checkbox).value
             lang_widget = self.query_one("#select-lang", Select)
             if lang_widget.value != Select.BLANK:
                 self._cfg["language"] = lang_widget.value
@@ -398,13 +408,20 @@ class SelectScreen(Screen):
             pass
 
         # 检查 Token
-        if not self._cfg.get("token"):
+        tokens = TokenManager.parse_tokens(self._cfg.get("token", ""))
+        if not tokens:
             self.notify("请填写 MinerU Token", severity="error")
             return
 
+        # 构建 TokenManager
+        lb = self._cfg.get("lb_enabled")
+        if lb is None:
+            lb = len(tokens) > 1
+        token_manager = TokenManager(tokens, lb_enabled=bool(lb))
+
         # 过渡到进度屏
         to_process = [f for f in sel if f.duplicate_action != DuplicateAction.SKIP]
-        self.app.push_screen(ProgressScreen(to_process, self._cfg))
+        self.app.push_screen(ProgressScreen(to_process, self._cfg, token_manager))
 
     def action_quit_app(self) -> None:
         self.app.exit()
@@ -416,6 +433,7 @@ class SelectScreen(Screen):
         if event.button.id == "btn-save-cfg":
             try:
                 self._cfg["token"] = self.query_one("#input-token", Input).value.strip()
+                self._cfg["lb_enabled"] = self.query_one("#cb-lb", Checkbox).value
                 lang_widget = self.query_one("#select-lang", Select)
                 if lang_widget.value != Select.BLANK:
                     self._cfg["language"] = lang_widget.value
@@ -559,10 +577,11 @@ class ProgressScreen(Screen):
     # 响应式变量
     _log_lines: reactive[list[str]] = reactive(list)
 
-    def __init__(self, file_nodes: list[FileNode], cfg: dict, **kwargs):
+    def __init__(self, file_nodes: list[FileNode], cfg: dict, token_manager: TokenManager, **kwargs):
         super().__init__(**kwargs)
         self._file_nodes = file_nodes
         self._cfg = cfg
+        self._token_manager = token_manager
         self._statuses: dict[FileNode, str] = {fn: FileStatus.WAITING for fn in file_nodes}
         self._messages: dict[FileNode, str] = {}
         self._log: list[str] = []
@@ -626,8 +645,10 @@ class ProgressScreen(Screen):
         summary = (
             f"总进度: {self._done_count + self._fail_count} / {self._total}\n"
             f"✓ 成功: {self._done_count}  ✗ 失败: {self._fail_count}\n"
-            f"已耗时: {mm:02d}:{ss:02d}"
+            f"已耗时: {mm:02d}:{ss:02d}\n"
         )
+        # Token 状态
+        summary += "\nToken 状态:\n" + "\n".join(self._token_manager.status_lines())
         if self._finished:
             summary += "\n\n[已完成] 按 Q 退出"
         try:
@@ -652,7 +673,7 @@ class ProgressScreen(Screen):
         import logging as _logging
 
         cfg = self._cfg
-        token = cfg["token"]
+        token_manager = self._token_manager
         proxies = __import__("config").build_proxies(cfg["proxy_mode"], cfg.get("proxy_url", ""))
         proxy_mode = cfg["proxy_mode"]
         proxy_url = cfg.get("proxy_url", "")
@@ -682,6 +703,8 @@ class ProgressScreen(Screen):
 
         # batch_id → [FileNode]
         batch_node_map: dict[str, list[FileNode]] = {}
+        # batch_id → token_idx
+        batch_token_idx: dict[str, int] = {}
         # FileNode → output_stem
         stem_map: dict[FileNode, str] = {}
 
@@ -708,8 +731,8 @@ class ProgressScreen(Screen):
                         )
 
             try:
-                batch_id, upload_results = submit_and_upload_batch(
-                    batch, token,
+                batch_id, upload_results, token_idx = submit_and_upload_batch(
+                    batch, token_manager,
                     model_version="vlm",
                     language=cfg.get("language", "ch"),
                     proxies=proxies,
@@ -720,6 +743,7 @@ class ProgressScreen(Screen):
                 # 只保留上传成功的文件
                 success_nodes = [fn for fn in batch if upload_results.get(fn.path, False)]
                 batch_node_map[batch_id] = success_nodes
+                batch_token_idx[batch_id] = token_idx
                 for fn in success_nodes:
                     self._statuses[fn] = FileStatus.PARSING
                     self._messages[fn] = "排队中"
@@ -767,9 +791,10 @@ class ProgressScreen(Screen):
                         self._fail_count += 1
                         self._log_line(f"[失败] {fn.path.name}: {r.get('err_msg', '')}")
 
+        batch_token_pairs = [(bid, batch_token_idx.get(bid, 0)) for bid in batch_node_map]
         poll_results = poll_batches_concurrent(
-            list(batch_node_map.keys()),
-            token,
+            batch_token_pairs,
+            token_manager,
             interval=poll_interval,
             timeout=timeout,
             proxies=proxies,

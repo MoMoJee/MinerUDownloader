@@ -35,7 +35,7 @@ HTTP_TIMEOUT = 30           # requests 超时（秒）
 
 # ── 默认配置值 ────────────────────────────────────────────────────────────────
 _DEFAULTS: dict[str, Any] = {
-    "token": "",
+    "token": "",          # str（单个）或 list[str]（多个），YAML 两种格式均可
     "language": "ch",
     "proxy_mode": "system",   # system / custom / none
     "proxy_url": "",
@@ -45,6 +45,7 @@ _DEFAULTS: dict[str, Any] = {
     "keep_zip": False,
     "keep_json": False,
     "duplicate_default": None,  # overwrite / skip / rename / null
+    "lb_enabled": None,         # None=自动（多Token时开启），True/False=手动
 }
 
 _YAML_HEADER = """\
@@ -77,6 +78,15 @@ def save_config(cfg: dict[str, Any]) -> None:
     """将配置字典写入 YAML 文件。"""
     # 只保存已知键，避免写入垃圾数据
     filtered = {k: cfg.get(k, _DEFAULTS[k]) for k in _DEFAULTS}
+    # token: 单个存字符串，多个存列表
+    from token_manager import TokenManager
+    tokens = TokenManager.parse_tokens(filtered.get("token", ""))
+    if len(tokens) == 1:
+        filtered["token"] = tokens[0]
+    elif len(tokens) > 1:
+        filtered["token"] = tokens
+    else:
+        filtered["token"] = ""
     content = _YAML_HEADER + yaml.dump(
         filtered,
         allow_unicode=True,
@@ -93,9 +103,9 @@ def merge_cli_args(cfg: dict[str, Any], args: Any) -> dict[str, Any]:
     """
     result = dict(cfg)
 
-    # token
+    # token（支持逗号分隔多个）
     if getattr(args, "token", None):
-        result["token"] = args.token
+        result["token"] = args.token  # 原始字符串，由 TokenManager.parse_tokens 解析
 
     # proxy
     if getattr(args, "no_proxy", False):
