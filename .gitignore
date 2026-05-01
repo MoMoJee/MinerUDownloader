@@ -1,0 +1,87 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+.npm
+.eslintcache
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+*.cover
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.jbeval
+
+# Logs
+logs/
+*.log
+~/.kicad-mcp/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Testing
+test_output/
+schematic_test_output/
+coverage.xml
+.coverage.*
+
+# Data & Databases
+data/
+*.db
+*.db-journal
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Generated local config files (contain machine-specific paths)
+windows-mcp-config.json
+.mcp.json
+
+# Personal notes / local contributions (not for upstream)
+myContribution/
+CLAUDE.md
+/mineru_config.yaml
