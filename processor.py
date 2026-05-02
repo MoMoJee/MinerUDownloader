@@ -170,3 +170,93 @@ def download_results_concurrent(
                 on_done(fn, md_path, err)
 
     return results
+
+
+def download_and_extract_zip(zip_url: str, proxies: dict | None = None) -> str | None:
+    """
+    下载解析结果 ZIP，提取 full.md 文本内容并返回字符串。
+    不写入任何文件。失败返回 None。
+    用于 PDF 拆分重提后合并 markdown。
+    """
+    try:
+        zip_bytes = _download_with_retry(zip_url, proxies)
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                if Path(name).name == "full.md":
+                    return zf.read(name).decode("utf-8", errors="replace")
+        logger.warning("download_and_extract_zip: ZIP 中未找到 full.md: %s", zip_url[:80])
+        return None
+    except Exception as exc:
+        logger.error("download_and_extract_zip 失败: %s", exc)
+        return None
+
+
+def download_chunk_zip(
+    zip_url: str,
+    out_dir: Path,
+    chunk_stem: str,
+    keep_zip: bool,
+    keep_json: bool,
+    proxies: dict | None = None,
+) -> str | None:
+    """
+    下载单个分片的解析结果 ZIP，完整处理所有内容：
+    - full.md 文本以字符串返回（由调用方合并后写入）
+    - images/* 写入 out_dir/images/（与正常文件共享同一 images 目录）
+    - keep_zip=True 时将 ZIP 保存为 out_dir/{chunk_stem}.zip
+    - keep_json=True 时保存 JSON 文件到 out_dir/
+    失败返回 None。
+    """
+    try:
+        zip_bytes = _download_with_retry(zip_url, proxies)
+    except Exception as exc:
+        logger.error("download_chunk_zip 下载失败: %s", exc)
+        return None
+
+    if keep_zip:
+        try:
+            (out_dir / f"{chunk_stem}.zip").write_bytes(zip_bytes)
+            logger.debug("已保存分片 ZIP: %s", chunk_stem)
+        except OSError as exc:
+            logger.warning("保存分片 ZIP 失败: %s", exc)
+
+    images_dir = out_dir / "images"
+    md_text: str | None = None
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                p = Path(name)
+                fname = p.name
+                parts = p.parts
+
+                if fname == "full.md":
+                    md_text = zf.read(name).decode("utf-8", errors="replace")
+                    continue
+
+                if len(parts) >= 2 and parts[0] == "images":
+                    try:
+                        images_dir.mkdir(parents=True, exist_ok=True)
+                        dest = images_dir / fname
+                        dest.write_bytes(zf.read(name))
+                    except OSError as exc:
+                        logger.warning("写入分片图片失败 %s: %s", fname, exc)
+                    continue
+
+                if fname.endswith("_origin.pdf"):
+                    continue
+
+                if fname.endswith(".json") and keep_json:
+                    try:
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        (out_dir / fname).write_bytes(zf.read(name))
+                    except OSError as exc:
+                        logger.warning("写入分片 JSON 失败 %s: %s", fname, exc)
+                    continue
+    except Exception as exc:
+        logger.error("download_chunk_zip 解压失败: %s", exc)
+        return None
+
+    if md_text is None:
+        logger.warning("download_chunk_zip: ZIP 中未找到 full.md: %s", zip_url[:80])
+    return md_text

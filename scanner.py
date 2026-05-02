@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 from config import SUPPORTED_EXTENSIONS
 
@@ -90,18 +91,25 @@ class DirNode:
         return total
 
 
-def scan(root: Path) -> DirNode:
+def scan(root: Path, on_progress: "Callable[[str, int], None] | None" = None) -> DirNode:
     """
     递归扫描 root 目录，返回根 DirNode。
     - 跳过以 '.' 开头的隐藏目录
     - 只保留 SUPPORTED_EXTENSIONS 中的文件（大小写不敏感）
     - 扫描后检测每个 FileNode 对应的 .md 是否已存在
     - 空目录节点会被裁剪（不出现在树中）
+    on_progress(file_name, total_count)：每发现一个文件时回调（可选）
     """
     root = root.resolve()
-    node = _scan_dir(root, root)
+    counter = [0]
+
+    def _progress_cb(name: str) -> None:
+        counter[0] += 1
+        if on_progress:
+            on_progress(name, counter[0])
+
+    node = _scan_dir(root, root, _progress_cb)
     if node is None:
-        # 目录下没有支持的文件
         return DirNode(path=root, rel_path=Path("."), children=[])
     return node
 
@@ -120,7 +128,7 @@ def _safe_is_dir(p: Path) -> bool:
         return False
 
 
-def _scan_dir(path: Path, root: Path) -> DirNode | None:
+def _scan_dir(path: Path, root: Path, progress_cb: "Callable[[str], None] | None" = None) -> DirNode | None:
     """递归构建 DirNode；若目录内没有支持的文件则返回 None。"""
     rel = path.relative_to(root) if path != root else Path(".")
     node = DirNode(path=path, rel_path=rel)
@@ -134,7 +142,7 @@ def _scan_dir(path: Path, root: Path) -> DirNode | None:
         if _safe_is_dir(entry):
             if entry.name.startswith("."):
                 continue
-            child = _scan_dir(entry, root)
+            child = _scan_dir(entry, root, progress_cb)
             if child is not None:
                 node.children.append(child)
         elif _safe_is_file(entry):
@@ -142,6 +150,8 @@ def _scan_dir(path: Path, root: Path) -> DirNode | None:
                 file_node = _make_file_node(entry, root)
                 if file_node is not None:
                     node.children.append(file_node)
+                    if progress_cb:
+                        progress_cb(entry.name)
 
     if not node.children:
         return None

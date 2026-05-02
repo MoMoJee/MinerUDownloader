@@ -78,6 +78,11 @@ a = Analysis(
         'http',
         'http.client',
         'http.cookiejar',
+        # PDF 拆分
+        'pypdf',
+        'pypdf.generic',
+        'pypdf._reader',
+        'pypdf._writer',
     ],
     hookspath=[],
     hooksconfig={},

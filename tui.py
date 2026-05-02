@@ -25,6 +25,8 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    ListView,
+    ListItem,
     RadioButton,
     RadioSet,
     Select,
@@ -38,6 +40,15 @@ from config import load_config, save_config
 from token_manager import TokenManager
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_dir(d: "Path") -> None:
+    """删除临时目录，忽略错误。"""
+    import shutil
+    try:
+        shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 CSS = """
@@ -142,6 +153,273 @@ def _fmt_size(b: int) -> str:
             return f"{b:.1f} {unit}" if unit != "B" else f"{b} B"
         b /= 1024
     return f"{b:.1f} TB"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+CSS += """
+#picker-path-bar {
+    height: 3;
+    layout: horizontal;
+}
+#picker-path-bar Input {
+    width: 1fr;
+}
+#picker-path-bar Button {
+    width: 8;
+    margin-left: 1;
+}
+#dir-list {
+    height: 1fr;
+    border: solid $primary;
+}
+#picker-actions {
+    height: 3;
+    layout: horizontal;
+    align: left middle;
+}
+#picker-status {
+    height: 1;
+    color: $text-muted;
+}
+#picker-hint {
+    height: 1;
+    color: $text-muted;
+}
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FolderPickerScreen — 启动时选择目标文件夹
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FolderPickerScreen(Screen):
+    """启动时选择目标文件夹的界面。
+    用户导航到要解析的文件夹后，点击“确认”进入扫描阶段。
+    """
+
+    BINDINGS = [
+        Binding("q,escape", "quit_app", "退出"),
+    ]
+
+    def __init__(self, initial_dir: "Path", cfg: dict, **kwargs):
+        super().__init__(**kwargs)
+        self._current = Path(initial_dir).resolve()
+        self._cfg = cfg
+        self._entries: list[Path] = []  # 与 ListView 条目一一对应
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        yield Label("📂  导航到要解析的文件夹，按 Enter 进入子目录")
+        with Horizontal(id="picker-path-bar"):
+            yield Input(value=str(self._current), id="path-input")
+            yield Button("跳转", id="btn-goto", variant="default")
+        yield ListView(id="dir-list")
+        with Horizontal(id="picker-actions"):
+            yield Button("✓ 解析此文件夹", id="btn-confirm", variant="success")
+            yield Button("↑ 上一级", id="btn-up", variant="default")
+        yield Label("", id="picker-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._refresh_list()
+
+    # ── 目录列表刷新 ────────────────────────────────────────────────────────────────
+
+    def _refresh_list(self) -> None:
+        from config import SUPPORTED_EXTENSIONS as _EXT
+        lv: ListView = self.query_one("#dir-list", ListView)
+        lv.clear()
+        self._entries = []
+
+        # —— 上一级（非根目录时显示）
+        parent = self._current.parent
+        if parent != self._current:
+            lv.append(ListItem(Label("⬆  .. (上一级)")))
+            self._entries.append(parent)
+
+        # —— Windows 驱动器列表（在根目录时显示）
+        if parent == self._current:
+            import string
+            for letter in string.ascii_uppercase:
+                drive = Path(f"{letter}:\\")
+                try:
+                    if drive.exists():
+                        lv.append(ListItem(Label(f"💾  {letter}:\\")))
+                        self._entries.append(drive)
+                except OSError:
+                    pass
+
+        # —— 子目录
+        try:
+            subdirs = sorted(
+                (e for e in self._current.iterdir()
+                 if not e.name.startswith('.') and self._safe_is_dir(e)),
+                key=lambda p: p.name.lower()
+            )
+        except (PermissionError, OSError):
+            subdirs = []
+
+        for d in subdirs:
+            lv.append(ListItem(Label(f"📁  {d.name}")))
+            self._entries.append(d)
+
+        # —— 更新路径输入框
+        try:
+            self.query_one("#path-input", Input).value = str(self._current)
+        except NoMatches:
+            pass
+
+        # —— 统计当前目录直接包含的支持文件数
+        try:
+            count = sum(
+                1 for f in self._current.iterdir()
+                if self._safe_is_file(f) and f.suffix.lower() in _EXT
+            )
+            if count:
+                msg = f"当前目录直接包含 {count} 个支持的文件（子目录中可能还有更多）"
+            else:
+                msg = "当前目录无支持的文件，可进入子目录浏览"
+            self.query_one("#picker-status", Label).update(msg)
+        except (PermissionError, OSError):
+            try:
+                self.query_one("#picker-status", Label).update("")
+            except NoMatches:
+                pass
+
+    @staticmethod
+    def _safe_is_dir(p: Path) -> bool:
+        try:
+            return p.is_dir()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _safe_is_file(p: Path) -> bool:
+        try:
+            return p.is_file()
+        except OSError:
+            return False
+
+    # ── 事件处理 ───────────────────────────────────────────────────────────────────
+
+    def on_list_view_selected(self, event: "ListView.Selected") -> None:
+        """Enter 键或鼠标点击条目时进入子目录。"""
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self._entries):
+            self._current = self._entries[idx]
+            self._refresh_list()
+
+    def on_input_submitted(self, event: "Input.Submitted") -> None:
+        """Input 回车：跳转到输入的路径。"""
+        if event.input.id == "path-input":
+            self._goto_path(event.value.strip())
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-confirm":
+            self.app.switch_screen(ScanningScreen(self._current, self._cfg))
+        elif event.button.id == "btn-up":
+            parent = self._current.parent
+            if parent != self._current:
+                self._current = parent
+                self._refresh_list()
+        elif event.button.id == "btn-goto":
+            path_str = self.query_one("#path-input", Input).value.strip()
+            self._goto_path(path_str)
+
+    def _goto_path(self, path_str: str) -> None:
+        if not path_str:
+            return
+        p = Path(path_str)
+        if p.exists() and self._safe_is_dir(p):
+            self._current = p.resolve()
+            self._refresh_list()
+        else:
+            self.notify("路径不存在或不是目录", severity="error")
+
+    def action_quit_app(self) -> None:
+        self.app.exit()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ScanningScreen — 启动时扫描目录
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ScanningScreen(Screen):
+    """扫描目录时显示的过渡屏，扫描完成后自动跳转到 SelectScreen。"""
+
+    DEFAULT_CSS = """
+    ScanningScreen {
+        align: center middle;
+    }
+    #scan-box {
+        width: 60;
+        height: 9;
+        border: solid $accent;
+        padding: 1 2;
+        align: center middle;
+    }
+    #scan-status {
+        text-align: center;
+        color: $text;
+    }
+    #scan-count {
+        text-align: center;
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, root_dir: "Path", cfg: dict, **kwargs):
+        super().__init__(**kwargs)
+        self._root_dir = root_dir
+        self._cfg = cfg
+        self._scanned = 0
+        self._current_name = ""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="scan-box"):
+            yield Label("⏳ 正在扫描文件...", id="scan-status")
+            yield Label("", id="scan-count")
+
+    def on_mount(self) -> None:
+        self._worker = threading.Thread(target=self._do_scan, daemon=True)
+        self._worker.start()
+        self.set_interval(0.2, self._refresh_scan_ui)
+
+    def _do_scan(self) -> None:
+        from scanner import scan as _scan
+        def _progress(name: str, count: int) -> None:
+            self._current_name = name
+            self._scanned = count
+        self._root_node = _scan(self._root_dir, on_progress=_progress)
+        self._scan_done = True
+
+    def _refresh_scan_ui(self) -> None:
+        if not hasattr(self, "_scan_done"):
+            try:
+                dots = "." * (int(time.monotonic() * 2) % 4)
+                self.query_one("#scan-status", Label).update(f"⏳ 正在扫描文件{dots}")
+                name = self._current_name
+                count = self._scanned
+                if name:
+                    self.query_one("#scan-count", Label).update(
+                        f"已发现 {count} 个文件\n{name[:40]}"
+                    )
+                else:
+                    self.query_one("#scan-count", Label).update("扫描中...")
+            except Exception:
+                pass
+            return
+        # 扫描完成
+        root_node = self._root_node
+        if root_node.file_count == 0:
+            self.query_one("#scan-status", Label).update("⚠ 未找到任何支持的文件")
+            self.query_one("#scan-count", Label).update("请将工具放到含 PDF/Word/PPT 文件的文件夹旁边运行")
+            return
+        self.query_one("#scan-status", Label).update(
+            f"✓ 扫描完成，共 {root_node.file_count} 个文件"
+        )
+        self.app.switch_screen(SelectScreen(root_node, self._cfg))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -813,6 +1091,32 @@ class ProgressScreen(Screen):
             on_batch_progress=on_batch_progress,
         )
 
+        # ── 检测超页失败，自动拆分重提 ──
+        # 找出因 "number of pages exceeds limit" 而失败的 PDF 文件
+        overlimit_nodes: list[FileNode] = []
+        for bid, extract_results in poll_results.items():
+            nodes = batch_node_map.get(bid, [])
+            name_map = {fn.path.name: fn for fn in nodes}
+            for r in extract_results:
+                fn = name_map.get(r.get("file_name", ""))
+                if fn is None:
+                    continue
+                if r.get("state") == "failed" and "number of pages exceeds limit" in r.get("err_msg", ""):
+                    overlimit_nodes.append(fn)
+
+        if overlimit_nodes:
+            self._log_line(f"发现 {len(overlimit_nodes)} 个超页文件，尝试自动拆分重提...")
+            for fn in overlimit_nodes:
+                self._statuses[fn] = FileStatus.PARSING
+                self._messages[fn] = "拆分中..."
+            self._handle_overlimit_files(
+                overlimit_nodes, stem_map, cfg, token_manager, proxies,
+                batch_size, poll_interval, timeout, keep_zip, keep_json,
+                proxy_mode, proxy_url, skipped,
+            )
+            # 更新失败计数（已被 _handle_overlimit_files 内部修改）
+            pass
+
         # ── 下载阶段 ──
         download_tasks = []
         for bid, extract_results in poll_results.items():
@@ -821,6 +1125,9 @@ class ProgressScreen(Screen):
             for r in extract_results:
                 fn = name_map.get(r.get("file_name", ""))
                 if fn is None or r.get("state") != "done":
+                    continue
+                # 如果已被拆分处理，跳过（状态已被更新为 DONE 或 FAILED）
+                if self._statuses.get(fn) in (FileStatus.DONE, FileStatus.FAILED) and fn in overlimit_nodes:
                     continue
                 zip_url = r.get("full_zip_url", "")
                 if zip_url:
@@ -851,6 +1158,251 @@ class ProgressScreen(Screen):
             f"跳过 {len(skipped)}"
         )
 
+    def _handle_overlimit_files(
+        self,
+        nodes: list[FileNode],
+        stem_map: dict,
+        cfg: dict,
+        token_manager,
+        proxies: dict | None,
+        batch_size: int,
+        poll_interval: int,
+        timeout: int,
+        keep_zip: bool,
+        keep_json: bool,
+        proxy_mode: str,
+        proxy_url: str,
+        skipped: list[FileNode],
+    ) -> None:
+        """
+        对每个超页 PDF：
+        1. 用 pypdf 拆成 ≤180 页的分片（临时文件）
+        2. 上传分片 → 轮询 → 下载各分片 .md
+        3. 按顺序合并所有分片 .md 为最终 .md
+        4. 清理临时分片
+        """
+        import tempfile
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            for fn in nodes:
+                self._statuses[fn] = FileStatus.FAILED
+                self._messages[fn] = "需要 pypdf 拆分但未安装，请 pip install pypdf"
+                self._fail_count += 1
+            return
+
+        from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
+        from processor import download_chunk_zip
+        from scanner import resolve_output_stem
+
+        CHUNK_PAGES = 180  # 每片不超过此页数
+
+        for fn in nodes:
+            self._log_line(f"[拆分] {fn.path.name}：读取页数...")
+            self._statuses[fn] = FileStatus.PARSING
+            self._messages[fn] = "读取 PDF 页数..."
+            try:
+                reader = PdfReader(str(fn.path))
+                total_pages = len(reader.pages)
+            except Exception as exc:
+                self._statuses[fn] = FileStatus.FAILED
+                self._messages[fn] = f"读取 PDF 失败: {exc}"
+                self._fail_count += 1
+                self._log_line(f"[失败] {fn.path.name} 读取失败: {exc}")
+                continue
+
+            self._log_line(f"[拆分] {fn.path.name}：{total_pages} 页，拆为 ≤{CHUNK_PAGES} 页的分片")
+            self._messages[fn] = f"共 {total_pages} 页，拆分中..."
+
+            # 生成分片临时文件
+            tmpdir = Path(tempfile.mkdtemp(prefix="mineru_split_"))
+            chunk_paths: list[Path] = []
+            try:
+                chunk_idx = 0
+                for start in range(0, total_pages, CHUNK_PAGES):
+                    end = min(start + CHUNK_PAGES, total_pages)
+                    writer = PdfWriter()
+                    for page_num in range(start, end):
+                        writer.add_page(reader.pages[page_num])
+                    chunk_name = f"{fn.path.stem}_part{chunk_idx+1:03d}.pdf"
+                    chunk_path = tmpdir / chunk_name
+                    with open(chunk_path, "wb") as f:
+                        writer.write(f)
+                    chunk_paths.append(chunk_path)
+                    chunk_idx += 1
+                    self._messages[fn] = f"已拆 {chunk_idx} 片 ({start+1}-{end}/{total_pages})"
+            except Exception as exc:
+                self._statuses[fn] = FileStatus.FAILED
+                self._messages[fn] = f"拆分失败: {exc}"
+                self._fail_count += 1
+                self._log_line(f"[失败] {fn.path.name} 拆分失败: {exc}")
+                _cleanup_dir(tmpdir)
+                continue
+
+            self._log_line(f"[拆分] {fn.path.name}：共 {len(chunk_paths)} 片，开始上传...")
+            self._messages[fn] = f"上传 {len(chunk_paths)} 个分片..."
+            self._statuses[fn] = FileStatus.UPLOADING
+
+            # 把分片当普通文件上传（用临时 FileNode-like 对象）
+            from dataclasses import dataclass as _dc
+            @_dc
+            class _TmpNode:
+                path: Path
+                duplicate_action: object = None
+
+            tmp_nodes = [_TmpNode(path=cp) for cp in chunk_paths]
+            chunk_batches = build_batches(tmp_nodes, batch_size)
+            chunk_batch_map: dict[str, list] = {}
+            chunk_batch_token: dict[str, int] = {}
+
+            upload_ok = True
+            for cb in chunk_batches:
+                try:
+                    bid, upload_res, tidx = submit_and_upload_batch(
+                        cb, token_manager,
+                        model_version="vlm",
+                        language=cfg.get("language", "ch"),
+                        proxies=proxies,
+                        proxy_mode=proxy_mode,
+                        proxy_url=proxy_url,
+                    )
+                    ok_nodes = [n for n in cb if upload_res.get(n.path, False)]
+                    chunk_batch_map[bid] = ok_nodes
+                    chunk_batch_token[bid] = tidx
+                except Exception as exc:
+                    self._log_line(f"[失败] {fn.path.name} 分片上传失败: {exc}")
+                    upload_ok = False
+                    break
+
+            if not upload_ok or not chunk_batch_map:
+                self._statuses[fn] = FileStatus.FAILED
+                self._messages[fn] = "分片上传失败"
+                self._fail_count += 1
+                _cleanup_dir(tmpdir)
+                continue
+
+            self._statuses[fn] = FileStatus.PARSING
+            self._messages[fn] = f"轮询 {len(chunk_paths)} 个分片..."
+
+            # 用于统计各分片状态
+            chunk_done: set[str] = set()
+            chunk_failed: set[str] = set()
+            chunk_total = sum(len(v) for v in chunk_batch_map.values())
+
+            def _on_chunk_progress(bid: str, results: list[dict]) -> None:
+                for r in results:
+                    cname = r.get("file_name", "")
+                    state = r.get("state", "")
+                    if state == "done":
+                        chunk_done.add(cname)
+                    elif state == "failed":
+                        chunk_failed.add(cname)
+                done_n = len(chunk_done)
+                fail_n = len(chunk_failed)
+                running = [
+                    r for r in results
+                    if r.get("state") == "running"
+                ]
+                if running:
+                    prog = running[0].get("extract_progress", {})
+                    pg = f"{prog.get('extracted_pages','?')}/{prog.get('total_pages','?')}页"
+                    self._messages[fn] = (
+                        f"解析分片 {done_n+fail_n}/{chunk_total}，"
+                        f"当前: {pg}，完成 {done_n} 失败 {fail_n}"
+                    )
+                else:
+                    self._messages[fn] = (
+                        f"解析分片 {done_n+fail_n}/{chunk_total}，"
+                        f"完成 {done_n} 失败 {fail_n}"
+                    )
+
+            chunk_pairs = [(bid, chunk_batch_token[bid]) for bid in chunk_batch_map]
+            chunk_poll = poll_batches_concurrent(
+                chunk_pairs, token_manager,
+                interval=poll_interval, timeout=timeout, proxies=proxies,
+                on_batch_progress=_on_chunk_progress,
+            )
+
+            # 下载并合并各分片 .md
+            self._statuses[fn] = FileStatus.DOWNLOADING
+            self._messages[fn] = "下载并合并分片..."
+
+            # 按分片顺序收集 md 内容
+            part_mds: dict[str, str] = {}  # chunk_name → md text
+            download_fail = False
+            for bid, results in chunk_poll.items():
+                ok_nodes = chunk_batch_map.get(bid, [])
+                cname_map = {n.path.name: n for n in ok_nodes}
+                for r in results:
+                    cname = r.get("file_name", "")
+                    cnode = cname_map.get(cname)
+                    if cnode is None:
+                        continue
+                    if r.get("state") != "done":
+                        self._log_line(f"[警告] 分片 {cname} 解析未完成: {r.get('err_msg','')}")
+                        download_fail = True
+                        continue
+                    zip_url = r.get("full_zip_url", "")
+                    if not zip_url:
+                        download_fail = True
+                        continue
+                    # chunk_stem = 分片文件名去掉 .pdf 后缀，用于 ZIP/JSON 命名
+                    chunk_stem = cnode.path.stem
+                    md_text = download_chunk_zip(
+                        zip_url,
+                        out_dir=fn.path.parent,
+                        chunk_stem=chunk_stem,
+                        keep_zip=keep_zip,
+                        keep_json=keep_json,
+                        proxies=proxies,
+                    )
+                    if md_text is None:
+                        download_fail = True
+                        self._log_line(f"[警告] 分片 {cname} 下载失败")
+                        continue
+                    part_mds[cname] = md_text
+
+            if download_fail or len(part_mds) < len(chunk_paths):
+                self._log_line(f"[警告] {fn.path.name} 部分分片失败，尝试合并已有部分")
+
+            # 按原始顺序合并
+            ordered_mds = []
+            for cp in chunk_paths:
+                md = part_mds.get(cp.name)
+                if md:
+                    ordered_mds.append(md)
+
+            if not ordered_mds:
+                self._statuses[fn] = FileStatus.FAILED
+                self._messages[fn] = "所有分片下载均失败"
+                self._fail_count += 1
+                self._log_line(f"[失败] {fn.path.name} 所有分片均失败")
+                _cleanup_dir(tmpdir)
+                continue
+
+            # 写入合并后的 .md
+            out_stem = stem_map.get(fn) or fn.path.stem
+            out_md = fn.path.parent / f"{out_stem}.md"
+            separator = f"\n\n---\n<!-- {fn.path.name} 第 {{part}} 部分 -->\n\n"
+            combined = ""
+            for i, md in enumerate(ordered_mds):
+                if i > 0:
+                    combined += f"\n\n---\n<!-- 第 {i+1} 部分 -->\n\n"
+                combined += md
+            try:
+                out_md.write_text(combined, encoding="utf-8")
+                self._statuses[fn] = FileStatus.DONE
+                self._messages[fn] = f"✓ 拆分合并 → {out_md.name}"
+                self._done_count += 1
+                self._log_line(f"[完成] {fn.path.name} 拆分合并完成 → {out_md.name}（{len(ordered_mds)}/{len(chunk_paths)} 片）")
+            except OSError as exc:
+                self._statuses[fn] = FileStatus.FAILED
+                self._messages[fn] = f"写入合并 .md 失败: {exc}"
+                self._fail_count += 1
+                self._log_line(f"[失败] {fn.path.name} 写入合并 .md 失败: {exc}")
+
+            _cleanup_dir(tmpdir)
+
     def _log_line(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
         self._log.append(f"[{ts}] {msg}")
@@ -865,22 +1417,30 @@ class ProgressScreen(Screen):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MinerUApp(App):
-    """主应用，入口屏为 SelectScreen。"""
+    """主应用。
+    show_picker=True 时先显示 FolderPickerScreen，否则直接进入 ScanningScreen。
+    """
 
     CSS = CSS
     TITLE = "MinerU 批量解析下载工具"
     SUB_TITLE = "精准解析 · vlm 模型"
 
-    def __init__(self, root_node: DirNode, cfg: dict, **kwargs):
+    def __init__(self, root_dir: "Path", cfg: dict, show_picker: bool = False, **kwargs):
         super().__init__(**kwargs)
-        self._root_node = root_node
+        self._root_dir = root_dir
         self._cfg = cfg
+        self._show_picker = show_picker
 
     def on_mount(self) -> None:
-        self.push_screen(SelectScreen(self._root_node, self._cfg))
+        if self._show_picker:
+            self.push_screen(FolderPickerScreen(self._root_dir, self._cfg))
+        else:
+            self.push_screen(ScanningScreen(self._root_dir, self._cfg))
 
 
-def run_tui(root_node: DirNode, cfg: dict) -> None:
-    """启动 TUI 应用的入口函数。"""
-    app = MinerUApp(root_node=root_node, cfg=cfg)
+def run_tui(root_dir: "Path", cfg: dict, show_picker: bool = False) -> None:
+    """启动 TUI 应用的入口函数。
+    show_picker=True 时先显示文件夹选择界面。
+    """
+    app = MinerUApp(root_dir=root_dir, cfg=cfg, show_picker=show_picker)
     app.run()

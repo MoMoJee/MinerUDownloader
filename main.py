@@ -235,25 +235,39 @@ def main() -> None:
         save_config(cfg)
         print("配置已保存到 mineru_config.yaml")
 
-    # 4. 扫描目录
-    root_dir = Path(args.root_dir).resolve()
-    if not root_dir.exists() or not root_dir.is_dir():
-        print(f"[错误] 目录不存在或不是目录: {root_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    root_node = scan(root_dir)
-
-    if root_node.file_count == 0:
-        print("未在指定目录下找到任何支持的文件。", file=sys.stderr)
-        sys.exit(0)
-
-    # 5. 分发到 TUI 或 CLI
-    use_cli = args.cli  # --tui 是默认，不需要特判
+    # 4. 确定根目录
+    raw_root = args.root_dir
+    use_cli = args.cli
 
     if use_cli:
+        # CLI 模式：必须有明确目录（或默认当前目录），同步扫描
+        root_dir = Path(raw_root).resolve()
+        if not root_dir.exists() or not root_dir.is_dir():
+            print(f"[错误] 目录不存在或不是目录: {root_dir}", file=sys.stderr)
+            sys.exit(1)
+        root_node = scan(root_dir)
+        if root_node.file_count == 0:
+            print("未在指定目录下找到任何支持的文件。", file=sys.stderr)
+            sys.exit(0)
         from cli import run_cli
         run_cli(root_node, cfg)
     else:
+        # TUI 模式
+        # 未显式指定目录 → 显示文件夹选择界面（FolderPickerScreen）
+        show_picker = (raw_root == '.')
+        if show_picker:
+            # 初始目录：打包时指向 exe 所在文件夹的父级，开发时指向 cwd
+            if getattr(sys, 'frozen', False):
+                initial_dir = Path(sys.executable).parent.parent
+            else:
+                initial_dir = Path.cwd()
+        else:
+            initial_dir = Path(raw_root).resolve()
+            if not initial_dir.exists() or not initial_dir.is_dir():
+                print(f"[错误] 目录不存在或不是目录: {initial_dir}", file=sys.stderr)
+                sys.exit(1)
+
+        # 5. 启动 TUI
         try:
             from tui import run_tui
         except ImportError as exc:
@@ -264,7 +278,7 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        run_tui(root_node, cfg)
+        run_tui(initial_dir, cfg, show_picker=show_picker)
 
 
 if __name__ == "__main__":
