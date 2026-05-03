@@ -44,7 +44,7 @@ def _relaunch_if_double_clicked() -> None:
             '-NoExit',
             '-Command', (
                 f"Set-Location -LiteralPath '{work_dir}'; "
-                f"& '{exe_path}'; "
+                f"& '{exe_path}' --folder-picker; "
                 "Write-Host ''; "
                 "Write-Host ' 程序已结束，按任意键关闭...' -NoNewline; "
                 "$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')"
@@ -171,7 +171,14 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="save_config",
         help="将本次命令行参数写回 mineru_config.yaml",
     )
-
+    # 隐藏参数：双击重启时由 _relaunch_if_double_clicked 传入
+    parser.add_argument(
+        "--folder-picker",
+        action="store_true",
+        default=False,
+        dest="folder_picker",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -253,8 +260,9 @@ def main() -> None:
         run_cli(root_node, cfg)
     else:
         # TUI 模式
-        # 未显式指定目录 → 显示文件夹选择界面（FolderPickerScreen）
-        show_picker = (raw_root == '.')
+        # 仅在双击重启（传入 --folder-picker）时显示文件夹选择界面；
+        # 在终端直接运行时（即使未指定目录）也直接扫描当前目录。
+        show_picker = args.folder_picker
         if show_picker:
             # 初始目录：打包时指向 exe 所在文件夹的父级，开发时指向 cwd
             if getattr(sys, 'frozen', False):

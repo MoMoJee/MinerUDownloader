@@ -187,6 +187,98 @@ CSS += """
 }
 """
 
+CSS += """
+#onboard-content {
+    height: 1fr;
+    padding: 1 2;
+    overflow-y: auto;
+}
+#onboard-text {
+    width: 1fr;
+}
+#onboard-actions {
+    height: 3;
+    layout: horizontal;
+    align: center middle;
+}
+"""
+
+# ── 引导页文本 ────────────────────────────────────────────────────────────────
+ONBOARD_TEXT = """\
+[bold]MinerU 批量解析下载工具[/bold] — 使用说明
+
+[bold cyan]工具用途[/bold cyan]
+将本地 PDF / Word / PPT / 图片批量提交到 MinerU API 进行智能解析，
+自动将结果下载为 Markdown 文件，保存到原文件所在目录。
+
+[bold cyan]获取 API Token[/bold cyan]
+1. 访问 https://mineru.net/apiManage/token
+2. 登录后点击「创建 Token」
+3. 复制 sk-... 开头的密钥，粘贴到主界面右侧「Token」输入框
+4. 点击「保存配置」，下次启动自动加载
+5. 支持多个 Token（英文逗号分隔），可启用负载均衡
+
+[bold cyan]代理设置[/bold cyan]
+mineru只允许国内网络访问，国外用户和启动了代理的国内用户需要注意
+• 使用系统代理：自动读取系统代理环境变量
+• 自定义代理：手动填写地址，如 http://127.0.0.1:7890
+• 不使用代理：直连 mineru.net（推荐国内用户开了代理时使用）
+
+[bold cyan]基本流程[/bold cyan]
+1. 选择要解析的文件夹
+   双击 exe 启动时弹出文件夹选择界面；终端运行时直接扫描当前目录
+2. 在文件列表中勾选要解析的文件（默认全选）
+3. 在右侧面板配置 Token 和参数
+4. 点击「▶ 开始解析」或按 [bold]G[/bold] 键提交
+
+[bold cyan]快捷键[/bold cyan]
+[bold]A[/bold] — 全选     [bold]N[/bold] — 全不选    [bold]T[/bold] — 切换当前选中
+[bold]G[/bold] — 开始解析  [bold]D[/bold] — 处理重复  [bold]Q[/bold] — 退出
+
+[bold cyan]注意事项[/bold cyan]
+• 解析消耗 MinerU API 配额，请注意余量
+• 超过 200 页的 PDF 自动拆分上传，结果自动合并为一个 .md
+• 已有同名 .md 文件时会提示选择覆盖 / 跳过 / 改名
+• 可随时在主界面点击「📂 换目录」切换解析文件夹
+• 再次查看本说明：主界面点击「❓ 帮助」
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OnboardingScreen — 首次运行引导 / 帮助说明
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OnboardingScreen(Screen):
+    """首次运行引导 / 帮助说明界面。"""
+
+    BINDINGS = [
+        Binding("q,escape", "close_screen", "关闭"),
+    ]
+
+    def __init__(self, cfg: dict, **kwargs):
+        super().__init__(**kwargs)
+        self._cfg = cfg
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        with ScrollableContainer(id="onboard-content"):
+            yield Static(ONBOARD_TEXT, id="onboard-text", markup=True)
+        with Horizontal(id="onboard-actions"):
+            yield Button("✓  知道了，开始使用", id="btn-onboard-ok", variant="success")
+        yield Footer()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-onboard-ok":
+            self._finish()
+
+    def action_close_screen(self) -> None:
+        self._finish()
+
+    def _finish(self) -> None:
+        self._cfg["first_run"] = False
+        save_config(self._cfg)
+        self.dismiss(None)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FolderPickerScreen — 启动时选择目标文件夹
@@ -249,19 +341,35 @@ class FolderPickerScreen(Screen):
                 except OSError:
                     pass
 
-        # —— 子目录
+        # —— 子目录 + 文件
         try:
             subdirs = sorted(
                 (e for e in self._current.iterdir()
                  if not e.name.startswith('.') and self._safe_is_dir(e)),
                 key=lambda p: p.name.lower()
             )
+            files_in_dir = sorted(
+                (e for e in self._current.iterdir()
+                 if not e.name.startswith('.') and self._safe_is_file(e)),
+                key=lambda p: p.name.lower()
+            )
         except (PermissionError, OSError):
             subdirs = []
+            files_in_dir = []
 
         for d in subdirs:
             lv.append(ListItem(Label(f"📁  {d.name}")))
             self._entries.append(d)
+
+        for f in files_in_dir:
+            supported = f.suffix.lower() in _EXT
+            icon = "📄" if supported else "  ·"
+            try:
+                size_str = f"  {_fmt_size(f.stat().st_size)}"
+            except OSError:
+                size_str = ""
+            lv.append(ListItem(Label(f"{icon}  {f.name}{size_str}")))
+            self._entries.append(f)
 
         # —— 更新路径输入框
         try:
@@ -303,11 +411,13 @@ class FolderPickerScreen(Screen):
     # ── 事件处理 ───────────────────────────────────────────────────────────────────
 
     def on_list_view_selected(self, event: "ListView.Selected") -> None:
-        """Enter 键或鼠标点击条目时进入子目录。"""
+        """目录条目进入子目录；文件条目不响应。"""
         idx = event.list_view.index
         if idx is not None and 0 <= idx < len(self._entries):
-            self._current = self._entries[idx]
-            self._refresh_list()
+            p = self._entries[idx]
+            if self._safe_is_dir(p):
+                self._current = p
+                self._refresh_list()
 
     def on_input_submitted(self, event: "Input.Submitted") -> None:
         """Input 回车：跳转到输入的路径。"""
@@ -316,7 +426,7 @@ class FolderPickerScreen(Screen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-confirm":
-            self.app.switch_screen(ScanningScreen(self._current, self._cfg))
+            self.dismiss(self._current)
         elif event.button.id == "btn-up":
             parent = self._current.parent
             if parent != self._current:
@@ -337,7 +447,7 @@ class FolderPickerScreen(Screen):
             self.notify("路径不存在或不是目录", severity="error")
 
     def action_quit_app(self) -> None:
-        self.app.exit()
+        self.dismiss(None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -518,6 +628,8 @@ class SelectScreen(Screen):
                 )
                 yield Button("保存配置", id="btn-save-cfg", variant="default")
                 yield Button("▶ 开始解析", id="btn-confirm", variant="success")
+                yield Button("📂 换目录", id="btn-change-dir", variant="default")
+                yield Button("❓ 帮助", id="btn-help", variant="default")
 
         with Horizontal(id="status-bar"):
             yield Static("", id="status-text")
@@ -704,9 +816,23 @@ class SelectScreen(Screen):
     def action_quit_app(self) -> None:
         self.app.exit()
 
+    def _on_folder_picked(self, path: "Any") -> None:
+        """换目录回调：用户在 FolderPickerScreen 中选择了新文件夹。"""
+        if path is not None:
+            self.app.switch_screen(ScanningScreen(path, self._cfg))
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-confirm":
             self.action_confirm()
+            return
+        if event.button.id == "btn-change-dir":
+            self.app.push_screen(
+                FolderPickerScreen(self._root_node.path, self._cfg),
+                self._on_folder_picked,
+            )
+            return
+        if event.button.id == "btn-help":
+            self.app.push_screen(OnboardingScreen(self._cfg))
             return
         if event.button.id == "btn-save-cfg":
             try:
@@ -1418,6 +1544,7 @@ class ProgressScreen(Screen):
 
 class MinerUApp(App):
     """主应用。
+    首次运行时先显示引导页；
     show_picker=True 时先显示 FolderPickerScreen，否则直接进入 ScanningScreen。
     """
 
@@ -1432,10 +1559,28 @@ class MinerUApp(App):
         self._show_picker = show_picker
 
     def on_mount(self) -> None:
+        if self._cfg.get("first_run", True):
+            self.push_screen(OnboardingScreen(self._cfg), self._after_onboarding)
+        else:
+            self._launch_main_screen()
+
+    def _after_onboarding(self, _: "Any") -> None:
+        self._launch_main_screen()
+
+    def _launch_main_screen(self) -> None:
         if self._show_picker:
-            self.push_screen(FolderPickerScreen(self._root_dir, self._cfg))
+            self.push_screen(
+                FolderPickerScreen(self._root_dir, self._cfg),
+                self._on_folder_confirmed,
+            )
         else:
             self.push_screen(ScanningScreen(self._root_dir, self._cfg))
+
+    def _on_folder_confirmed(self, path: "Any") -> None:
+        if path is None:
+            self.exit()
+        else:
+            self.push_screen(ScanningScreen(path, self._cfg))
 
 
 def run_tui(root_dir: "Path", cfg: dict, show_picker: bool = False) -> None:

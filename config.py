@@ -56,6 +56,7 @@ _DEFAULTS: dict[str, Any] = {
     "keep_json": False,
     "duplicate_default": None,  # overwrite / skip / rename / null
     "lb_enabled": None,         # None=自动（多Token时开启），True/False=手动
+    "first_run": True,          # True=首次运行展示引导页；False=已完成引导
 }
 
 _YAML_HEADER = """\
