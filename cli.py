@@ -34,7 +34,7 @@ from scanner import (
 from config import build_proxies, save_config
 from token_manager import TokenManager
 
-console = Console()
+console = Console(legacy_windows=False)
 logger = logging.getLogger(__name__)
 
 
@@ -104,7 +104,7 @@ def _print_file_tree(all_files: list[FileNode], root: DirNode) -> None:
     def _build_rich_tree(node: DirNode, rtree: RichTree) -> None:
         for child in node.children:
             if isinstance(child, DirNode):
-                sub = rtree.add(f"[bold blue]📁 {child.path.name}/[/bold blue]")
+                sub = rtree.add(f"[bold blue][D] {child.path.name}/[/bold blue]")
                 _build_rich_tree(child, sub)
             else:
                 counter[0] += 1
@@ -112,13 +112,13 @@ def _print_file_tree(all_files: list[FileNode], root: DirNode) -> None:
                 idx_map[idx] = child
                 dup_tag = ""
                 if child.has_duplicate:
-                    dup_tag = f" [yellow]⚠ [已有 {child.existing_md.name}][/yellow]"
+                    dup_tag = f" [yellow][!] [已有 {child.existing_md.name}][/yellow]"
                 size_str = _fmt_size(child.size)
                 rtree.add(
                     f"[dim]{idx:>3}[/dim]  {child.path.name}{dup_tag}  [green]{size_str}[/green]"
                 )
 
-    root_tree = RichTree(f"[bold]📁 {root.path.name or root.path}[/bold]")
+    root_tree = RichTree(f"[bold][D] {root.path.name or root.path}[/bold]")
     _build_rich_tree(root, root_tree)
     console.print(root_tree)
     return idx_map
@@ -141,7 +141,7 @@ def _phase_select(root: DirNode) -> list[FileNode]:
         f"[bold]扫描目录:[/bold] {root.path}\n"
         f"找到 [green]{len(all_files)}[/green] 个可解析文件"
         f"（共 [cyan]{_fmt_size(total_size)}[/cyan]）"
-        + (f"  [yellow]⚠ {dup_count} 个已有 .md 输出[/yellow]" if dup_count else "")
+        + (f"  [yellow][!] {dup_count} 个已有 .md 输出[/yellow]" if dup_count else "")
     )
     console.print()
 
@@ -173,7 +173,7 @@ def _phase_select(root: DirNode) -> list[FileNode]:
     console.print(
         f"\n[bold green]已选中 {len(selected)} 个文件"
         f"（{_fmt_size(sel_size)}）[/bold green]"
-        + (f"  [yellow]⚠ {dup_sel} 个有重复 .md[/yellow]" if dup_sel else "")
+        + (f"  [yellow][!] {dup_sel} 个有重复 .md[/yellow]" if dup_sel else "")
     )
     return selected
 
@@ -534,9 +534,9 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
         s = state.file_status.get(fn, "?")
         msg = state.file_msg.get(fn, "")
         if s == "done":
-            result_table.add_row("[green]✓[/green]", str(fn.rel_path), f"[green]{msg}[/green]")
+            result_table.add_row("[green]OK[/green]", str(fn.rel_path), f"[green]{msg}[/green]")
         elif s == "failed":
-            result_table.add_row("[red]✗[/red]", str(fn.rel_path), f"[red]{msg}[/red]")
+            result_table.add_row("[red]FAIL[/red]", str(fn.rel_path), f"[red]{msg}[/red]")
         else:
             result_table.add_row("[yellow]?[/yellow]", str(fn.rel_path), msg)
 

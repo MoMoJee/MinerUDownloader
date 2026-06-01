@@ -142,6 +142,8 @@ def _scan_dir(path: Path, root: Path, progress_cb: "Callable[[str], None] | None
         if _safe_is_dir(entry):
             if entry.name.startswith("."):
                 continue
+            if entry.name.lower() == "images":  # 跳过 images 文件夹（大小写不敏感）
+                continue
             child = _scan_dir(entry, root, progress_cb)
             if child is not None:
                 node.children.append(child)
@@ -167,15 +169,14 @@ def _make_file_node(path: Path, root: Path) -> FileNode | None:
         return None
     md_candidate = path.parent / (path.stem + ".md")
     existing_md = md_candidate if md_candidate.exists() else None
-    dup_action = DuplicateAction.NONE if existing_md else DuplicateAction.NONE
 
     return FileNode(
         path=path,
         rel_path=rel,
         size=size,
-        selected=True,
+        selected=existing_md is None,   # 已有同名 .md 时默认不选中
         existing_md=existing_md,
-        duplicate_action=dup_action,
+        duplicate_action=DuplicateAction.NONE,
     )
 
 
