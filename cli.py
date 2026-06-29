@@ -4,6 +4,7 @@ cli.py — 纯命令行交互模式（rich 格式化输出 + input() 向导）�
 """
 from __future__ import annotations
 
+import io
 import logging
 import sys
 import threading
@@ -34,7 +35,23 @@ from scanner import (
 from config import build_proxies, save_config
 from token_manager import TokenManager
 
-console = Console(legacy_windows=False)
+
+def _fix_stdio_encoding() -> None:
+    """PyInstaller 管道环境下强制 stdout/stderr 为 UTF-8，防止 GBK 编码器拒绝 Unicode 字符。"""
+    for name in ('stdout', 'stderr'):
+        stream = getattr(sys, name)
+        if stream.encoding and stream.encoding.lower() in ('gbk', 'cp936', 'cp950'):
+            try:
+                setattr(sys, name, io.TextIOWrapper(
+                    stream.buffer, encoding='utf-8', errors='replace'
+                ))
+            except Exception:
+                pass
+
+
+_fix_stdio_encoding()
+
+console = Console(legacy_windows=False, force_terminal=sys.stdout.isatty())
 logger = logging.getLogger(__name__)
 
 

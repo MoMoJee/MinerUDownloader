@@ -34,6 +34,7 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
     ".png", ".jpg", ".jpeg", ".jp2", ".webp", ".gif", ".bmp",
     ".doc", ".docx",
     ".ppt", ".pptx",
+    ".xls", ".xlsx",
 })
 
 # ── 并发 / 重试常量 ───────────────────────────────────────────────────────────
