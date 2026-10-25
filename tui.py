@@ -1202,10 +1202,14 @@ class ProgressScreen(Screen):
                         self._messages[fn] = "准备下载"
                 elif state == "failed":
                     if self._statuses[fn] != FileStatus.FAILED:
-                        self._statuses[fn] = FileStatus.FAILED
-                        self._messages[fn] = f"解析失败: {r.get('err_msg', '')}"
-                        self._fail_count += 1
-                        self._log_line(f"[失败] {fn.path.name}: {r.get('err_msg', '')}")
+                        if "number of pages exceeds limit" in r.get("err_msg", ""):
+                            self._statuses[fn] = FileStatus.PARSING
+                            self._messages[fn] = "超页，准备自动拆分..."
+                        else:
+                            self._statuses[fn] = FileStatus.FAILED
+                            self._messages[fn] = f"解析失败: {r.get('err_msg', '')}"
+                            self._fail_count += 1
+                            self._log_line(f"[失败] {fn.path.name}: {r.get('err_msg', '')}")
 
         batch_token_pairs = [(bid, batch_token_idx.get(bid, 0)) for bid in batch_node_map]
         poll_results = poll_batches_concurrent(

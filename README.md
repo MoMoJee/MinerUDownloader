@@ -189,6 +189,7 @@ MinerUDownloader/
 | `requests >= 2.31.0` | HTTP 客户端 |
 | `rich >= 13.0.0` | CLI 格式化输出 |
 | `pyyaml >= 6.0.0` | 配置文件读写 |
+| `pypdf >= 4.0.0` | 超页 PDF 自动拆分 |
 
 系统依赖：`curl.exe`（Windows 10 / 11 内置）
 

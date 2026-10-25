@@ -55,6 +55,15 @@ console = Console(legacy_windows=False, force_terminal=sys.stdout.isatty())
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_dir(d: Path) -> None:
+    """删除临时目录，忽略错误。"""
+    import shutil
+    try:
+        shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+
 # ── 工具 ──────────────────────────────────────────────────────────────────────
 
 def _fmt_size(b: int) -> str:
@@ -376,6 +385,242 @@ class _CliProgressState:
         logger.info(msg)
 
 
+def _handle_overlimit_files(
+    nodes: list[FileNode],
+    stem_map: dict,
+    cfg: dict,
+    token_manager,
+    proxies: dict | None,
+    batch_size: int,
+    poll_interval: int,
+    timeout: int,
+    keep_zip: bool,
+    keep_json: bool,
+    proxy_mode: str,
+    proxy_url: str,
+    state: "_CliProgressState",
+    progress,
+    dl_task,
+) -> None:
+    """
+    对每个超页 PDF：
+    1. 用 pypdf 拆成 ≤180 页的分片（临时文件）
+    2. 上传分片 → 轮询 → 下载各分片 .md
+    3. 按顺序合并所有分片 .md 为最终 .md
+    4. 清理临时分片
+    """
+    import tempfile
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        for fn in nodes:
+            state.set(fn, "failed", "需要 pypdf 拆分但未安装，请 pip install pypdf")
+            with state.lock:
+                state.failed += 1
+            state.log_line(f"[失败] {fn.path.name}: 需要 pypdf 拆分但未安装")
+            progress.advance(dl_task)
+        return
+
+    from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
+    from processor import download_chunk_zip
+    from dataclasses import dataclass
+
+    CHUNK_PAGES = 180
+
+    @dataclass
+    class _TmpNode:
+        path: Path
+
+    for fn in nodes:
+        state.log_line(f"[拆分] {fn.path.name}：读取页数...")
+        state.set(fn, "parsing", "读取 PDF 页数...")
+        try:
+            reader = PdfReader(str(fn.path))
+            total_pages = len(reader.pages)
+        except Exception as exc:
+            state.set(fn, "failed", f"读取 PDF 失败: {exc}")
+            with state.lock:
+                state.failed += 1
+            state.log_line(f"[失败] {fn.path.name} 读取失败: {exc}")
+            progress.advance(dl_task)
+            continue
+
+        state.log_line(f"[拆分] {fn.path.name}：{total_pages} 页，拆为 ≤{CHUNK_PAGES} 页的分片")
+        state.set(fn, "parsing", f"共 {total_pages} 页，拆分中...")
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="mineru_split_"))
+        chunk_paths: list[Path] = []
+        try:
+            chunk_idx = 0
+            for start in range(0, total_pages, CHUNK_PAGES):
+                end = min(start + CHUNK_PAGES, total_pages)
+                writer = PdfWriter()
+                for page_num in range(start, end):
+                    writer.add_page(reader.pages[page_num])
+                chunk_name = f"{fn.path.stem}_part{chunk_idx + 1:03d}.pdf"
+                chunk_path = tmpdir / chunk_name
+                with open(chunk_path, "wb") as f:
+                    writer.write(f)
+                chunk_paths.append(chunk_path)
+                chunk_idx += 1
+                state.set(fn, "parsing", f"已拆 {chunk_idx} 片 ({start + 1}-{end}/{total_pages})")
+        except Exception as exc:
+            state.set(fn, "failed", f"拆分失败: {exc}")
+            with state.lock:
+                state.failed += 1
+            state.log_line(f"[失败] {fn.path.name} 拆分失败: {exc}")
+            progress.advance(dl_task)
+            _cleanup_dir(tmpdir)
+            continue
+
+        state.log_line(f"[拆分] {fn.path.name}：共 {len(chunk_paths)} 片，开始上传...")
+        state.set(fn, "uploading", f"上传 {len(chunk_paths)} 个分片...")
+
+        tmp_nodes = [_TmpNode(path=cp) for cp in chunk_paths]
+        chunk_batches = build_batches(tmp_nodes, batch_size)
+        chunk_batch_map: dict[str, list] = {}
+        chunk_batch_token: dict[str, int] = {}
+
+        upload_ok = True
+        for cb in chunk_batches:
+            try:
+                bid, upload_res, tidx = submit_and_upload_batch(
+                    cb, token_manager,
+                    model_version="vlm",
+                    language=cfg.get("language", "ch"),
+                    proxies=proxies,
+                    proxy_mode=proxy_mode,
+                    proxy_url=proxy_url,
+                )
+                ok_nodes = [n for n in cb if upload_res.get(n.path, False)]
+                chunk_batch_map[bid] = ok_nodes
+                chunk_batch_token[bid] = tidx
+            except Exception as exc:
+                state.log_line(f"[失败] {fn.path.name} 分片上传失败: {exc}")
+                upload_ok = False
+                break
+
+        if not upload_ok or not chunk_batch_map:
+            state.set(fn, "failed", "分片上传失败")
+            with state.lock:
+                state.failed += 1
+            state.log_line(f"[失败] {fn.path.name} 分片上传失败")
+            progress.advance(dl_task)
+            _cleanup_dir(tmpdir)
+            continue
+
+        state.set(fn, "parsing", f"轮询 {len(chunk_paths)} 个分片...")
+
+        chunk_done: set[str] = set()
+        chunk_failed: set[str] = set()
+        chunk_total = sum(len(v) for v in chunk_batch_map.values())
+
+        def _on_chunk_progress(bid: str, results: list[dict]) -> None:
+            for r in results:
+                cname = r.get("file_name", "")
+                s = r.get("state", "")
+                if s == "done":
+                    chunk_done.add(cname)
+                elif s == "failed":
+                    chunk_failed.add(cname)
+            done_n = len(chunk_done)
+            fail_n = len(chunk_failed)
+            running = [r for r in results if r.get("state") == "running"]
+            if running:
+                prog = running[0].get("extract_progress", {})
+                pg = f"{prog.get('extracted_pages', '?')}/{prog.get('total_pages', '?')}页"
+                state.set(fn, "parsing",
+                          f"解析分片 {done_n + fail_n}/{chunk_total}，当前: {pg}，完成 {done_n} 失败 {fail_n}")
+            else:
+                state.set(fn, "parsing",
+                          f"解析分片 {done_n + fail_n}/{chunk_total}，完成 {done_n} 失败 {fail_n}")
+
+        chunk_pairs = [(bid, chunk_batch_token[bid]) for bid in chunk_batch_map]
+        chunk_poll = poll_batches_concurrent(
+            chunk_pairs, token_manager,
+            interval=poll_interval, timeout=timeout, proxies=proxies,
+            on_batch_progress=_on_chunk_progress,
+        )
+
+        state.set(fn, "downloading", "下载并合并分片...")
+
+        part_mds: dict[str, str] = {}
+        download_fail = False
+        for bid, results in chunk_poll.items():
+            ok_nodes = chunk_batch_map.get(bid, [])
+            cname_map = {n.path.name: n for n in ok_nodes}
+            for r in results:
+                cname = r.get("file_name", "")
+                cnode = cname_map.get(cname)
+                if cnode is None:
+                    continue
+                if r.get("state") != "done":
+                    state.log_line(f"[警告] 分片 {cname} 解析未完成: {r.get('err_msg', '')}")
+                    download_fail = True
+                    continue
+                zip_url = r.get("full_zip_url", "")
+                if not zip_url:
+                    download_fail = True
+                    continue
+                chunk_stem = cnode.path.stem
+                md_text = download_chunk_zip(
+                    zip_url,
+                    out_dir=fn.path.parent,
+                    chunk_stem=chunk_stem,
+                    keep_zip=keep_zip,
+                    keep_json=keep_json,
+                    proxies=proxies,
+                )
+                if md_text is None:
+                    download_fail = True
+                    state.log_line(f"[警告] 分片 {cname} 下载失败")
+                    continue
+                part_mds[cname] = md_text
+
+        if download_fail or len(part_mds) < len(chunk_paths):
+            state.log_line(f"[警告] {fn.path.name} 部分分片失败，尝试合并已有部分")
+
+        ordered_mds = []
+        for cp in chunk_paths:
+            md = part_mds.get(cp.name)
+            if md:
+                ordered_mds.append(md)
+
+        if not ordered_mds:
+            state.set(fn, "failed", "所有分片下载均失败")
+            with state.lock:
+                state.failed += 1
+            state.log_line(f"[失败] {fn.path.name} 所有分片均失败")
+            progress.advance(dl_task)
+            _cleanup_dir(tmpdir)
+            continue
+
+        out_stem = stem_map.get(fn) or fn.path.stem
+        out_md = fn.path.parent / f"{out_stem}.md"
+        combined = ""
+        for i, md in enumerate(ordered_mds):
+            if i > 0:
+                combined += f"\n\n---\n<!-- 第 {i + 1} 部分 -->\n\n"
+            combined += md
+        try:
+            out_md.write_text(combined, encoding="utf-8")
+            state.set(fn, "done", f"✓ 拆分合并 → {out_md.name}")
+            with state.lock:
+                state.done += 1
+            state.log_line(
+                f"[完成] {fn.path.name} 拆分合并完成 → {out_md.name}"
+                f"（{len(ordered_mds)}/{len(chunk_paths)} 片）"
+            )
+        except OSError as exc:
+            state.set(fn, "failed", f"写入合并 .md 失败: {exc}")
+            with state.lock:
+                state.failed += 1
+            state.log_line(f"[失败] {fn.path.name} 写入合并 .md 失败: {exc}")
+        progress.advance(dl_task)
+
+        _cleanup_dir(tmpdir)
+
+
 def _phase_process(selected: list[FileNode], cfg: dict) -> None:
     """提交、轮询、下载，rich Progress 展示进度，最终打印汇总。"""
     from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
@@ -495,10 +740,13 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
                     state.set(fn, "dl-ready", "准备下载")
                     progress.advance(parse_task)
                 elif s == "failed":
-                    state.set(fn, "failed", f"解析失败: {r.get('err_msg','')}")
-                    with state.lock:
-                        state.failed += 1
-                    state.log_line(f"[失败] {fn.path.name}: {r.get('err_msg','')}")
+                    if "number of pages exceeds limit" in r.get("err_msg", ""):
+                        state.set(fn, "parsing", "超页，准备自动拆分...")
+                    else:
+                        state.set(fn, "failed", f"解析失败: {r.get('err_msg','')}")
+                        with state.lock:
+                            state.failed += 1
+                        state.log_line(f"[失败] {fn.path.name}: {r.get('err_msg','')}")
                     progress.advance(parse_task)
 
         batch_token_pairs = [(bid, batch_token_idx.get(bid, 0)) for bid in batch_node_map]
@@ -506,6 +754,28 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
             batch_token_pairs, token_manager,
             poll_interval, timeout, proxies, on_bp
         )
+
+        # ── 检测超页失败，自动拆分重提 ──
+        overlimit_nodes: list[FileNode] = []
+        for bid, extract_results in poll_results.items():
+            nodes = batch_node_map.get(bid, [])
+            name_map = {fn.path.name: fn for fn in nodes}
+            for r in extract_results:
+                fn = name_map.get(r.get("file_name", ""))
+                if fn is None:
+                    continue
+                if r.get("state") == "failed" and "number of pages exceeds limit" in r.get("err_msg", ""):
+                    overlimit_nodes.append(fn)
+
+        if overlimit_nodes:
+            state.log_line(f"发现 {len(overlimit_nodes)} 个超页文件，尝试自动拆分重提...")
+            for fn in overlimit_nodes:
+                state.set(fn, "parsing", "拆分中...")
+            _handle_overlimit_files(
+                overlimit_nodes, stem_map, cfg, token_manager, proxies,
+                batch_size, poll_interval, timeout, keep_zip, keep_json,
+                proxy_mode, proxy_url, state, progress, dl_task,
+            )
 
         # ── 下载 ──
         progress.update(dl_task, description="下载结果")
