@@ -132,6 +132,13 @@ class TokenManager:
         with self._lock:
             return any(e.available for e in self.entries)
 
+    def has_other_available(self, idx: int) -> bool:
+        with self._lock:
+            return any(
+                i != idx and entry.available
+                for i, entry in enumerate(self.entries)
+            )
+
     def count(self) -> int:
         return len(self.entries)
 

@@ -4,8 +4,11 @@ cli.py — 纯命令行交互模式（rich 格式化输出 + input() 向导）�
 """
 from __future__ import annotations
 
+import fnmatch
 import io
+import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -53,6 +56,126 @@ _fix_stdio_encoding()
 
 console = Console(legacy_windows=False, force_terminal=sys.stdout.isatty())
 logger = logging.getLogger(__name__)
+
+_DUPLICATE_ACTIONS: dict[str, DuplicateAction] = {
+    "overwrite": DuplicateAction.OVERWRITE,
+    "skip": DuplicateAction.SKIP,
+    "rename": DuplicateAction.RENAME,
+}
+
+
+def _print_json(payload: dict) -> None:
+    """把机器可读结果写到 stdout，供 agent / 脚本解析。
+
+    使用 ASCII 转义，避免 Windows 控制台 / 管道编码差异导致 JSON 乱码。
+    """
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+    sys.stdout.flush()
+
+
+def _matches_pattern(rel_path: Path, pattern: str) -> bool:
+    """匹配相对路径或文件名；无斜杠的模式只匹配文件名。"""
+    pattern = pattern.replace("\\", "/").strip()
+    if not pattern:
+        return False
+    rel_posix = rel_path.as_posix()
+    if fnmatch.fnmatch(rel_posix, pattern):
+        return True
+    return "/" not in pattern and fnmatch.fnmatch(rel_path.name, pattern)
+
+
+def _filter_files(
+    files: list[FileNode],
+    include: list[str] | None,
+    exclude: list[str] | None,
+) -> list[FileNode]:
+    """按 --include / --exclude 的 glob 过滤文件。"""
+    result = files
+    if include:
+        result = [
+            f for f in result
+            if any(_matches_pattern(f.rel_path, p) for p in include)
+        ]
+    if exclude:
+        result = [
+            f for f in result
+            if not any(_matches_pattern(f.rel_path, p) for p in exclude)
+        ]
+    return result
+
+
+def _duplicate_policy(duplicate: str | None, cfg: dict) -> str:
+    """确定非交互模式下的重复 .md 策略：参数 > 配置 > skip。"""
+    if duplicate in _DUPLICATE_ACTIONS:
+        return duplicate
+    configured = cfg.get("duplicate_default")
+    if configured in _DUPLICATE_ACTIONS:
+        return configured
+    return "skip"
+
+
+def _load_file_list(list_path: Path, files: list[FileNode]) -> list[FileNode]:
+    """读取 --file-list，返回扫描结果中匹配的文件（保持扫描顺序）。"""
+    try:
+        text = list_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise RuntimeError(f"无法读取 --file-list: {exc}") from exc
+
+    entries = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not entries:
+        raise RuntimeError("--file-list 为空")
+
+    abs_map: dict[str, FileNode] = {}
+    rel_map: dict[str, FileNode] = {}
+    for fn in files:
+        abs_map[os.path.normcase(str(fn.path.resolve()))] = fn
+        rel_map[os.path.normcase(fn.rel_path.as_posix())] = fn
+
+    chosen: set[int] = set()
+    missing: list[str] = []
+    for entry in entries:
+        p = Path(entry)
+        if p.is_absolute():
+            try:
+                key = os.path.normcase(str(p.resolve()))
+            except OSError:
+                key = os.path.normcase(os.path.abspath(entry))
+            fn = abs_map.get(key)
+        else:
+            key = os.path.normcase(str(p))
+            fn = rel_map.get(key)
+        if fn is None:
+            missing.append(entry)
+        else:
+            chosen.add(id(fn))
+
+    if missing:
+        preview = "\n".join(f"  - {m}" for m in missing[:10])
+        more = f"\n  ... 还有 {len(missing) - 10} 个" if len(missing) > 10 else ""
+        raise RuntimeError(
+            f"--file-list 中有 {len(missing)} 个路径不在扫描结果中：\n{preview}{more}"
+        )
+
+    result = [fn for fn in files if id(fn) in chosen]
+    if not result:
+        raise RuntimeError("--file-list 未匹配到任何可处理文件")
+    return result
+
+
+def _apply_duplicate_policy(files: list[FileNode], policy: str) -> None:
+    action = _DUPLICATE_ACTIONS[policy]
+    for f in files:
+        if f.has_duplicate:
+            f.duplicate_action = action
+
+
+def _has_token(cfg: dict) -> bool:
+    return bool(TokenManager.parse_tokens(cfg.get("token", "")))
+
 
 
 def _cleanup_dir(d: Path) -> None:
@@ -123,41 +246,48 @@ def _parse_exclude_input(text: str, max_idx: int) -> set[int]:
 # ── 阶段一：扫描展示 ──────────────────────────────────────────────────────────
 
 def _print_file_tree(all_files: list[FileNode], root: DirNode) -> None:
-    """用 rich.Tree 打印目录结构，附带序号。"""
+    """用 rich.Tree 打印过滤后的目录结构，附带序号。"""
     idx_map: dict[int, FileNode] = {}  # 1-based序号 → FileNode
     counter = [0]
 
-    def _build_rich_tree(node: DirNode, rtree: RichTree) -> None:
-        for child in node.children:
-            if isinstance(child, DirNode):
-                sub = rtree.add(f"[bold blue][D] {child.path.name}/[/bold blue]")
-                _build_rich_tree(child, sub)
-            else:
-                counter[0] += 1
-                idx = counter[0]
-                idx_map[idx] = child
-                dup_tag = ""
-                if child.has_duplicate:
-                    dup_tag = f" [yellow][!] [已有 {child.existing_md.name}][/yellow]"
-                size_str = _fmt_size(child.size)
-                rtree.add(
-                    f"[dim]{idx:>3}[/dim]  {child.path.name}{dup_tag}  [green]{size_str}[/green]"
-                )
+    tree: dict = {"dirs": {}, "files": []}
+    for fn in all_files:
+        node = tree
+        for part in fn.rel_path.parts[:-1]:
+            node = node["dirs"].setdefault(part, {"dirs": {}, "files": []})
+        node["files"].append(fn)
+
+    def _build_rich_tree(node: dict, rtree: RichTree) -> None:
+        for name, child in node["dirs"].items():
+            sub = rtree.add(f"[bold blue][D] {name}/[/bold blue]")
+            _build_rich_tree(child, sub)
+        for child in node["files"]:
+            counter[0] += 1
+            idx = counter[0]
+            idx_map[idx] = child
+            dup_tag = ""
+            if child.has_duplicate:
+                dup_tag = f" [yellow][!] [已有 {child.existing_md.name}][/yellow]"
+            size_str = _fmt_size(child.size)
+            rtree.add(
+                f"[dim]{idx:>3}[/dim]  {child.path.name}{dup_tag}  [green]{size_str}[/green]"
+            )
 
     root_tree = RichTree(f"[bold][D] {root.path.name or root.path}[/bold]")
-    _build_rich_tree(root, root_tree)
+    _build_rich_tree(tree, root_tree)
     console.print(root_tree)
     return idx_map
 
 
 # ── 阶段二：文件选择 ──────────────────────────────────────────────────────────
 
-def _phase_select(root: DirNode) -> list[FileNode]:
+def _phase_select(root: DirNode, all_files: list[FileNode] | None = None) -> list[FileNode]:
     """展示文件树，收集排除序号，返回已选文件列表。"""
-    all_files = flatten_files(root)
+    if all_files is None:
+        all_files = flatten_files(root)
     if not all_files:
         console.print("[red]未找到任何支持的文件。[/red]")
-        sys.exit(0)
+        sys.exit(2)
 
     total_size = sum(f.size for f in all_files)
     dup_count = sum(1 for f in all_files if f.has_duplicate)
@@ -206,10 +336,17 @@ def _phase_select(root: DirNode) -> list[FileNode]:
 
 # ── 阶段三：重复文件处理 ──────────────────────────────────────────────────────
 
-def _phase_duplicate(selected: list[FileNode]) -> list[FileNode]:
+def _phase_duplicate(
+    selected: list[FileNode],
+    forced: str | None = None,
+) -> list[FileNode]:
     """处理重复文件的决策，返回更新了 duplicate_action 的列表。"""
     dup_files = [f for f in selected if f.has_duplicate]
     if not dup_files:
+        return selected
+
+    if forced in _DUPLICATE_ACTIONS:
+        _apply_duplicate_policy(selected, forced)
         return selected
 
     console.print()
@@ -253,8 +390,11 @@ def _phase_duplicate(selected: list[FileNode]) -> list[FileNode]:
 
 # ── 阶段四：选项确认 ──────────────────────────────────────────────────────────
 
-def _phase_options(cfg: dict) -> dict:
+def _phase_options(cfg: dict, assume_yes: bool = False) -> dict:
     """展示当前配置，询问是否修改，返回最终生效配置。"""
+    if assume_yes:
+        return cfg
+
     console.print()
     console.rule("[bold cyan]解析选项[/bold cyan]")
 
@@ -368,6 +508,7 @@ class _CliProgressState:
         self.lock = threading.Lock()
         self.file_status: dict[FileNode, str] = {}
         self.file_msg: dict[FileNode, str] = {}
+        self.file_output: dict[FileNode, str] = {}
         self.log: list[str] = []
         self.done = 0
         self.failed = 0
@@ -605,6 +746,7 @@ def _handle_overlimit_files(
         try:
             out_md.write_text(combined, encoding="utf-8")
             state.set(fn, "done", f"✓ 拆分合并 → {out_md.name}")
+            state.file_output[fn] = str(out_md)
             with state.lock:
                 state.done += 1
             state.log_line(
@@ -621,8 +763,14 @@ def _handle_overlimit_files(
         _cleanup_dir(tmpdir)
 
 
-def _phase_process(selected: list[FileNode], cfg: dict) -> None:
-    """提交、轮询、下载，rich Progress 展示进度，最终打印汇总。"""
+def _phase_process(
+    selected: list[FileNode],
+    cfg: dict,
+    assume_yes: bool = False,
+    quiet: bool = False,
+    root: Path | None = None,
+) -> dict:
+    """提交、轮询、下载，展示进度并返回结构化汇总。"""
     from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
     from processor import download_results_concurrent
 
@@ -638,8 +786,9 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
     lb = cfg.get("lb_enabled")
     if lb is None:
         lb = len(tokens) > 1
-    token_manager = TokenManager(tokens, lb_enabled=bool(lb))
-    console.print(f"[dim]Token: {' | '.join(tm.display for tm in token_manager.entries)}[/dim]")
+    token_manager = TokenManager(tokens, lb_enabled=bool(lb)) if tokens else None
+    if not quiet and to_process and token_manager is not None:
+        console.print(f"[dim]Token: {' | '.join(tm.display for tm in token_manager.entries)}[/dim]")
 
     proxies = build_proxies(cfg.get("proxy_mode", "system"), cfg.get("proxy_url", ""))
     proxy_mode = cfg.get("proxy_mode", "system")
@@ -673,6 +822,7 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
         TextColumn("{task.completed}/{task.total}"),
         TimeElapsedColumn(),
         console=console,
+        disable=quiet or not to_process,
     )
 
     with progress:
@@ -794,6 +944,7 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
             def on_dl(fn: FileNode, md_path, err: str | None) -> None:
                 if md_path:
                     state.set(fn, "done", f"→ {md_path.name}")
+                    state.file_output[fn] = str(md_path)
                     with state.lock:
                         state.done += 1
                     state.log_line(f"[完成] {fn.path.name} → {md_path.name}")
@@ -809,49 +960,279 @@ def _phase_process(selected: list[FileNode], cfg: dict) -> None:
             )
 
     # ── 汇总 ──
-    console.print()
-    console.rule("[bold green]完成汇总[/bold green]")
-
-    result_table = Table(show_header=True, header_style="bold")
-    result_table.add_column("状态", width=4)
-    result_table.add_column("文件", style="cyan")
-    result_table.add_column("输出 / 说明")
-
     for fn in to_process:
-        s = state.file_status.get(fn, "?")
-        msg = state.file_msg.get(fn, "")
-        if s == "done":
-            result_table.add_row("[green]OK[/green]", str(fn.rel_path), f"[green]{msg}[/green]")
-        elif s == "failed":
-            result_table.add_row("[red]FAIL[/red]", str(fn.rel_path), f"[red]{msg}[/red]")
+        if state.file_status.get(fn) not in ("done", "failed"):
+            state.set(fn, "failed", "未完成（轮询超时或未返回结果）")
+
+    files_payload: list[dict] = []
+    for fn in selected:
+        if fn.duplicate_action == DuplicateAction.SKIP:
+            status = "skipped"
+            msg = "已有同名 .md，按策略跳过"
+            output = None
         else:
-            result_table.add_row("[yellow]?[/yellow]", str(fn.rel_path), msg)
+            status = "done" if state.file_status.get(fn) == "done" else "failed"
+            msg = state.file_msg.get(fn, "")
+            output = state.file_output.get(fn)
+        files_payload.append({
+            "path": str(fn.path),
+            "rel_path": str(fn.rel_path),
+            "size": fn.size,
+            "status": status,
+            "message": msg,
+            "output": output,
+        })
 
-    for fn in skipped:
-        result_table.add_row("[dim]—[/dim]", str(fn.rel_path), "[dim]已跳过（保留旧 .md）[/dim]")
+    done_n = sum(1 for f in files_payload if f["status"] == "done")
+    failed_n = sum(1 for f in files_payload if f["status"] == "failed")
+    skipped_n = sum(1 for f in files_payload if f["status"] == "skipped")
+    batches = build_batches(to_process, batch_size)
+    result = {
+        "success": failed_n == 0,
+        "root": str(root) if root is not None else None,
+        "config": {
+            "token_configured": bool(tokens),
+            "language": language,
+            "batch_size": batch_size,
+            "poll_interval": poll_interval,
+            "timeout": timeout,
+            "keep_zip": bool(keep_zip),
+            "keep_json": bool(keep_json),
+            "proxy_mode": proxy_mode,
+            "lb_enabled": bool(lb),
+        },
+        "summary": {
+            "total": len(selected),
+            "done": done_n,
+            "failed": failed_n,
+            "skipped": skipped_n,
+            "batches": len(batches),
+            "selected_size": sum(f.size for f in to_process),
+        },
+        "files": files_payload,
+    }
 
-    console.print(result_table)
-    console.print(
-        f"\n[bold]成功: [green]{state.done}[/green]  "
-        f"失败: [red]{state.failed}[/red]  "
-        f"跳过: [yellow]{len(skipped)}[/yellow][/bold]"
-    )
-    if state.failed:
-        console.print("[dim]详细错误已写入 mineru_errors.log[/dim]")
+    if not quiet:
+        console.print()
+        console.rule("[bold green]完成汇总[/bold green]")
 
-    _ask("\n按回车退出: ")
+        result_table = Table(show_header=True, header_style="bold")
+        result_table.add_column("状态", width=4)
+        result_table.add_column("文件", style="cyan")
+        result_table.add_column("输出 / 说明")
+
+        for fn in to_process:
+            s = state.file_status.get(fn, "?")
+            msg = state.file_msg.get(fn, "")
+            if s == "done":
+                result_table.add_row("[green]OK[/green]", str(fn.rel_path), f"[green]{msg}[/green]")
+            else:
+                result_table.add_row("[red]FAIL[/red]", str(fn.rel_path), f"[red]{msg}[/red]")
+
+        for fn in skipped:
+            result_table.add_row("[dim]—[/dim]", str(fn.rel_path), "[dim]已跳过（保留旧 .md）[/dim]")
+
+        console.print(result_table)
+        console.print(
+            f"\n[bold]成功: [green]{done_n}[/green]  "
+            f"失败: [red]{failed_n}[/red]  "
+            f"跳过: [yellow]{skipped_n}[/yellow][/bold]"
+        )
+        if failed_n:
+            console.print("[dim]详细错误已写入 mineru_errors.log[/dim]")
+
+        if not assume_yes:
+            _ask("\n按回车退出: ")
+
+    return result
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
-def run_cli(root_node: DirNode, cfg: dict) -> None:
-    """CLI 模式入口，顺序执行各阶段。"""
-    selected = _phase_select(root_node)
-    selected = _phase_duplicate(selected)
-    cfg = _phase_options(cfg)
-    if not _phase_confirm(selected, cfg):
-        # 退回文件选择
-        console.print("[yellow]已取消，重新选择文件…[/yellow]")
-        run_cli(root_node, cfg)
-        return
-    _phase_process(selected, cfg)
+def _build_dry_run_payload(
+    root: Path,
+    files: list[FileNode],
+    cfg: dict,
+    policy: str,
+) -> dict:
+    to_process = [f for f in files if f.duplicate_action != DuplicateAction.SKIP]
+    batch_size = int(cfg.get("batch_size", 20))
+    return {
+        "success": True,
+        "dry_run": True,
+        "root": str(root),
+        "config": {
+            "token_configured": _has_token(cfg),
+            "language": cfg.get("language", "ch"),
+            "batch_size": batch_size,
+            "poll_interval": int(cfg.get("poll_interval", 8)),
+            "timeout": int(cfg.get("timeout", 1800)),
+            "keep_zip": bool(cfg.get("keep_zip", False)),
+            "keep_json": bool(cfg.get("keep_json", False)),
+            "proxy_mode": cfg.get("proxy_mode", "system"),
+            "lb_enabled": cfg.get("lb_enabled"),
+            "duplicate_policy": policy,
+        },
+        "summary": {
+            "total": len(files),
+            "will_process": len(to_process),
+            "skipped": len(files) - len(to_process),
+            "batches": (len(to_process) + batch_size - 1) // batch_size,
+            "selected_size": sum(f.size for f in to_process),
+        },
+        "files": [
+            {
+                "index": i,
+                "path": str(f.path),
+                "rel_path": str(f.rel_path),
+                "size": f.size,
+                "existing_md": str(f.existing_md) if f.existing_md else None,
+                "duplicate_action": f.duplicate_action.value,
+                "will_process": f.duplicate_action != DuplicateAction.SKIP,
+            }
+            for i, f in enumerate(files, 1)
+        ],
+    }
+
+
+def _print_dry_run(payload: dict) -> None:
+    console.rule("[bold cyan]Dry run（不会提交任何文件）[/bold cyan]")
+    console.print(f"[bold]扫描目录:[/bold] {payload['root']}")
+    console.print(
+        f"共 [green]{payload['summary']['total']}[/green] 个文件，"
+        f"将处理 [green]{payload['summary']['will_process']}[/green] 个，"
+        f"跳过 [yellow]{payload['summary']['skipped']}[/yellow] 个"
+        f"（{_fmt_size(payload['summary']['selected_size'])}，"
+        f"{payload['summary']['batches']} 批）"
+    )
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("#", width=4, justify="right")
+    table.add_column("文件", style="cyan")
+    table.add_column("大小", justify="right")
+    table.add_column("重复 .md", justify="center")
+    table.add_column("处理", justify="center")
+    for f in payload["files"]:
+        table.add_row(
+            str(f["index"]),
+            f["rel_path"],
+            _fmt_size(f["size"]),
+            "是" if f["existing_md"] else "否",
+            "处理" if f["will_process"] else "[yellow]跳过[/yellow]",
+        )
+    console.print(table)
+    console.print(
+        f"[dim]Token: {'已配置' if payload['config']['token_configured'] else '未配置'}"
+        f"  语言: {payload['config']['language']}"
+        f"  重复策略: {payload['config']['duplicate_policy']}[/dim]"
+    )
+
+
+def run_cli(
+    root_node: DirNode,
+    cfg: dict,
+    *,
+    interactive: bool = False,
+    dry_run: bool = False,
+    json_output: bool = False,
+    duplicate: str | None = None,
+    include: list[str] | None = None,
+    exclude: list[str] | None = None,
+    file_list: str | None = None,
+) -> int:
+    """CLI 模式入口。
+
+    默认是一次性非交互执行；interactive=True 时进入旧版向导。
+    返回进程退出码：0 成功，1 有文件失败，2 配置/扫描错误。
+    """
+    all_files = _filter_files(flatten_files(root_node), include, exclude)
+
+    if file_list is not None:
+        try:
+            all_files = _load_file_list(Path(file_list), all_files)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if json_output:
+                _print_json({
+                    "success": False,
+                    "root": str(root_node.path),
+                    "error": msg,
+                    "files": [],
+                })
+            else:
+                console.print(msg, style="red")
+            return 2
+
+    if not all_files:
+        msg = "未找到匹配的文件（检查 --include / --exclude / --file-list）"
+        if json_output:
+            _print_json({
+                "success": False,
+                "root": str(root_node.path),
+                "error": msg,
+                "files": [],
+            })
+        else:
+            console.print(msg, style="red")
+        return 2
+
+    policy = _duplicate_policy(duplicate, cfg)
+
+    if dry_run:
+        _apply_duplicate_policy(all_files, policy)
+        payload = _build_dry_run_payload(root_node.path, all_files, cfg, policy)
+        if json_output:
+            _print_json(payload)
+        else:
+            _print_dry_run(payload)
+        return 0
+
+    if interactive:
+        selected = _phase_select(root_node, all_files)
+        selected = _phase_duplicate(selected, duplicate)
+        cfg = _phase_options(cfg)
+        if not _phase_confirm(selected, cfg):
+            # 退回文件选择
+            console.print("[yellow]已取消，重新选择文件…[/yellow]")
+            return run_cli(
+                root_node,
+                cfg,
+                interactive=True,
+                dry_run=dry_run,
+                json_output=json_output,
+                duplicate=duplicate,
+                include=include,
+                exclude=exclude,
+                file_list=file_list,
+            )
+        result = _phase_process(selected, cfg, root=root_node.path)
+        return 0 if result["success"] else 1
+
+    # 一次性非交互执行
+    _apply_duplicate_policy(all_files, policy)
+    to_process = [f for f in all_files if f.duplicate_action != DuplicateAction.SKIP]
+    if to_process and not _has_token(cfg):
+        msg = "未配置 MinerU Token（设置 MINERU_TOKEN 或使用 --token）"
+        if json_output:
+            _print_json({
+                "success": False,
+                "root": str(root_node.path),
+                "error": msg,
+                "files": [],
+            })
+        else:
+            console.print(msg, style="red")
+        return 2
+    if not json_output:
+        console.print(
+            f"[bold]扫描目录:[/bold] {root_node.path}\n"
+            f"共 [green]{len(all_files)}[/green] 个文件，"
+            f"将处理 [green]{len(to_process)}[/green] 个，"
+            f"跳过 [yellow]{len(all_files) - len(to_process)}[/yellow] 个"
+            f"（重复 .md 策略: {policy}）"
+        )
+    result = _phase_process(
+        all_files, cfg, assume_yes=True, quiet=json_output, root=root_node.path
+    )
+    if json_output:
+        _print_json(result)
+    return 0 if result["success"] else 1

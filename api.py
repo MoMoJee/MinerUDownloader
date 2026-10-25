@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -21,6 +22,10 @@ from config import (
     MAX_UPLOAD_WORKERS,
     INTER_BATCH_DELAY,
     HTTP_TIMEOUT,
+    SUBMIT_MIN_INTERVAL,
+    SUBMIT_MAX_RETRIES,
+    SUBMIT_BACKOFF_BASE,
+    SUBMIT_MAX_BACKOFF,
     build_curl_proxy_args,
 )
 from errors import ErrorCategory, MinerUApiError, NoAvailableTokenError, parse_api_response
@@ -28,8 +33,35 @@ from token_manager import TokenManager
 
 logger = logging.getLogger(__name__)
 
+_SUBMIT_LOCK = threading.Lock()
+_LAST_SUBMIT_TS = 0.0
+
 
 # ── 申请上传 URL ──────────────────────────────────────────────────────────────
+
+def _retry_after_seconds(resp: requests.Response) -> float | None:
+    raw = (getattr(resp, "headers", None) or {}).get("Retry-After")
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(seconds, SUBMIT_MAX_BACKOFF))
+
+
+def _backoff_seconds(attempt: int) -> float:
+    exponent = max(attempt - 1, 0)
+    return min(SUBMIT_BACKOFF_BASE * (2 ** exponent), SUBMIT_MAX_BACKOFF)
+
+
+def _wait_before_submit() -> None:
+    global _LAST_SUBMIT_TS
+    wait = SUBMIT_MIN_INTERVAL - (time.monotonic() - _LAST_SUBMIT_TS)
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_SUBMIT_TS = time.monotonic()
+
 
 def apply_upload_urls(
     files: list[dict],
@@ -43,6 +75,8 @@ def apply_upload_urls(
 
     files: [{"name": "file.pdf", "is_ocr": False}, ...]
     返回: (batch_id, [upload_url, ...], token_idx)
+
+    同一进程内的申请请求串行化，并对 429 / 网络错误 / 暂时性业务错误做指数退避。
     """
     payload = {
         "files": files,
@@ -51,74 +85,131 @@ def apply_upload_urls(
     }
 
     last_exc: Exception | None = None
-    tried: set[int] = set()
+    attempts = 0
 
-    while True:
-        try:
-            token_idx, token = token_manager.get_token()
-        except NoAvailableTokenError as exc:
-            raise RuntimeError("所有 Token 均不可用，无法申请上传 URL") from exc
+    with _SUBMIT_LOCK:
+        while True:
+            try:
+                token_idx, token = token_manager.get_token()
+            except NoAvailableTokenError as exc:
+                message = "所有 Token 均不可用，无法申请上传 URL"
+                if last_exc:
+                    message += f"，最后错误: {last_exc}"
+                raise RuntimeError(message) from exc
 
-        if token_idx in tried:
-            # 已全部尝试一圈
-            raise RuntimeError(f"所有 Token 均申请上传 URL 失败，最后错误: {last_exc}")
-        tried.add(token_idx)
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            logger.debug("[apply_upload_urls] 尝试 Token[%d] token_prefix=%s... 文件数=%d",
+                         token_idx, token[:8] if len(token) > 8 else token, len(files))
+            _wait_before_submit()
 
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        logger.debug("[apply_upload_urls] 尝试 Token[%d] token_prefix=%s... 文件数=%d",
-                     token_idx, token[:8] if len(token) > 8 else token, len(files))
-        try:
-            resp = requests.post(
-                BATCH_URL,
-                json=payload,
-                headers=headers,
-                proxies=proxies,
-                timeout=HTTP_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            raise RuntimeError(f"申请上传 URL 网络错误: {exc}") from exc
-
-        logger.debug("[apply_upload_urls] Token[%d] HTTP %d", token_idx, resp.status_code)
-
-        # HTTP 401 / 429 → 标记 Token 并切换重试（不当作致命网络错误）
-        if resp.status_code == 401:
-            token_manager.report_error(token_idx, ErrorCategory.AUTH)
-            last_exc = RuntimeError(f"Token[{token_idx}] 认证失败 (401)")
-            logger.warning("Token[%d] 认证失败 (401)，切换 Token 重试", token_idx)
-            continue
-        if resp.status_code == 429:
-            token_manager.report_error(token_idx, ErrorCategory.RATE_LIMIT)
-            last_exc = RuntimeError(f"Token[{token_idx}] 限速 (429)")
-            logger.warning("Token[%d] 限速 (429)，切换 Token 重试", token_idx)
-            continue
-
-        try:
-            resp.raise_for_status()
-            data = resp.json()
-            parse_api_response(data)
-        except MinerUApiError as exc:
-            last_exc = exc
-            if exc.info.category in (ErrorCategory.AUTH, ErrorCategory.RATE_LIMIT):
-                token_manager.report_error(token_idx, exc.info.category)
-                logger.warning("Token[%d] 申请上传失败（%s），切换 Token 重试",
-                               token_idx, exc.info.category.value)
+            try:
+                resp = requests.post(
+                    BATCH_URL,
+                    json=payload,
+                    headers=headers,
+                    proxies=proxies,
+                    timeout=HTTP_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                attempts += 1
+                if attempts > SUBMIT_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"申请上传 URL 网络错误，已重试 {SUBMIT_MAX_RETRIES} 次: {exc}"
+                    ) from exc
+                wait = _backoff_seconds(attempts)
+                logger.warning("申请上传 URL 网络错误: %s，%.0f 秒后重试（%d/%d）",
+                               exc, wait, attempts, SUBMIT_MAX_RETRIES)
+                time.sleep(wait)
                 continue
-            raise
-        except requests.RequestException as exc:
-            raise RuntimeError(f"申请上传 URL 网络错误: {exc}") from exc
 
-        # used_batches 已在 get_token() 内部递增，此处不重复计数
-        batch_id: str = data["data"]["batch_id"]
-        upload_urls: list[str] = data["data"]["file_urls"]
-        logger.debug("[apply_upload_urls] 成功 batch_id=%s url_count=%d Token[%d]",
-                     batch_id, len(upload_urls), token_idx)
-        upload_urls: list[str] = data["data"]["file_urls"]
-        logger.debug("申请到 batch_id=%s，共 %d 个上传 URL（Token[%d]）",
-                     batch_id, len(upload_urls), token_idx)
-        return batch_id, upload_urls, token_idx
+            logger.debug("[apply_upload_urls] Token[%d] HTTP %d", token_idx, resp.status_code)
+
+            if resp.status_code == 401:
+                token_manager.report_error(token_idx, ErrorCategory.AUTH)
+                last_exc = RuntimeError(f"Token[{token_idx}] 认证失败 (401)")
+                logger.warning("Token[%d] 认证失败 (401)，切换 Token 重试", token_idx)
+                continue
+
+            if resp.status_code == 429:
+                last_exc = RuntimeError(f"Token[{token_idx}] 限流 (429)")
+                if token_manager.has_other_available(token_idx):
+                    token_manager.report_error(token_idx, ErrorCategory.RATE_LIMIT)
+                    logger.warning("Token[%d] 限流 (429)，切换 Token 重试", token_idx)
+                    continue
+                attempts += 1
+                if attempts > SUBMIT_MAX_RETRIES:
+                    token_manager.report_error(token_idx, ErrorCategory.RATE_LIMIT)
+                    raise RuntimeError(
+                        f"申请上传 URL 持续被限流，已重试 {SUBMIT_MAX_RETRIES} 次: {last_exc}"
+                    ) from last_exc
+                retry_after = _retry_after_seconds(resp)
+                wait = retry_after if retry_after is not None else _backoff_seconds(attempts)
+                logger.warning("Token[%d] 限流 (429)，%.0f 秒后重试（%d/%d）",
+                               token_idx, wait, attempts, SUBMIT_MAX_RETRIES)
+                time.sleep(wait)
+                continue
+
+            if resp.status_code >= 500:
+                last_exc = RuntimeError(f"申请上传 URL 服务错误: HTTP {resp.status_code}")
+                attempts += 1
+                if attempts > SUBMIT_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"申请上传 URL 服务错误，已重试 {SUBMIT_MAX_RETRIES} 次: "
+                        f"HTTP {resp.status_code}"
+                    ) from last_exc
+                wait = _backoff_seconds(attempts)
+                logger.warning("申请上传 URL HTTP %d，%.0f 秒后重试（%d/%d）",
+                               resp.status_code, wait, attempts, SUBMIT_MAX_RETRIES)
+                time.sleep(wait)
+                continue
+
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"申请上传 URL 失败: HTTP {resp.status_code} {resp.text[:200]}"
+                )
+
+            try:
+                data = resp.json()
+                parse_api_response(data)
+            except MinerUApiError as exc:
+                last_exc = exc
+                category = exc.info.category
+                if category in (ErrorCategory.AUTH, ErrorCategory.RATE_LIMIT):
+                    token_manager.report_error(token_idx, category)
+                    logger.warning("Token[%d] 申请上传失败（%s），切换 Token 重试",
+                                   token_idx, category.value)
+                    continue
+                if category == ErrorCategory.TRANSIENT:
+                    attempts += 1
+                    if attempts > SUBMIT_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"申请上传 URL 持续失败，已重试 {SUBMIT_MAX_RETRIES} 次: {exc}"
+                        ) from exc
+                    wait = _backoff_seconds(attempts)
+                    logger.warning("申请上传 URL 暂时失败: %s，%.0f 秒后重试（%d/%d）",
+                                   exc, wait, attempts, SUBMIT_MAX_RETRIES)
+                    time.sleep(wait)
+                    continue
+                raise
+            except ValueError as exc:
+                last_exc = exc
+                attempts += 1
+                if attempts > SUBMIT_MAX_RETRIES:
+                    raise RuntimeError(f"申请上传 URL 响应解析失败: {exc}") from exc
+                wait = _backoff_seconds(attempts)
+                logger.warning("申请上传 URL 响应解析失败: %s，%.0f 秒后重试", exc, wait)
+                time.sleep(wait)
+                continue
+
+            batch_id: str = data["data"]["batch_id"]
+            upload_urls: list[str] = data["data"]["file_urls"]
+            logger.debug("[apply_upload_urls] 成功 batch_id=%s url_count=%d Token[%d]",
+                         batch_id, len(upload_urls), token_idx)
+            return batch_id, upload_urls, token_idx
 
 
 # ── curl.exe 上传 ─────────────────────────────────────────────────────────────

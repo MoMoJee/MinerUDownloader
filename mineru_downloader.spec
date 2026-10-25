@@ -64,6 +64,7 @@ a = Analysis(
         'logging',
         'pathlib',
         'yaml',
+        'jobs',
         # urllib3 / requests 依赖的标准库（不能放进 excludes）
         'email',
         'email.message',

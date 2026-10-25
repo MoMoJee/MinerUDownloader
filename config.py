@@ -34,7 +34,6 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
     ".png", ".jpg", ".jpeg", ".jp2", ".webp", ".gif", ".bmp",
     ".doc", ".docx",
     ".ppt", ".pptx",
-    ".xls", ".xlsx",
 })
 
 # ── 并发 / 重试常量 ───────────────────────────────────────────────────────────
@@ -42,6 +41,10 @@ MAX_UPLOAD_WORKERS = 4
 MAX_DOWNLOAD_WORKERS = 4
 DOWNLOAD_RETRY = 3
 INTER_BATCH_DELAY = 2       # 批次间延迟（秒）
+SUBMIT_MIN_INTERVAL = 2.0    # 两次申请上传 URL 的最小间隔（秒）
+SUBMIT_MAX_RETRIES = 5       # 申请上传 URL 的限流/临时错误重试次数
+SUBMIT_BACKOFF_BASE = 2      # 指数退避基数（秒）
+SUBMIT_MAX_BACKOFF = 60      # 单次最大退避（秒）
 HTTP_TIMEOUT = 30           # requests 超时（秒）
 
 # ── 默认配置值 ────────────────────────────────────────────────────────────────
@@ -67,14 +70,16 @@ _YAML_HEADER = """\
 """
 
 
-def load_config() -> dict[str, Any]:
+def load_config(write_if_missing: bool = True) -> dict[str, Any]:
     """
     读取 YAML 配置。若文件不存在，则写入默认值后返回。
     缺失的键会用默认值补全（向前兼容）。
+    write_if_missing=False 时只返回默认值，不落盘（用于 dry-run 等只读场景）。
     """
     if not CONFIG_FILE.exists():
         cfg = dict(_DEFAULTS)
-        save_config(cfg)
+        if write_if_missing:
+            save_config(cfg)
         return cfg
 
     with CONFIG_FILE.open("r", encoding="utf-8") as f:
