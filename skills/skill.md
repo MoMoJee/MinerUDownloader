@@ -20,44 +20,101 @@ description: 使用本仓库的 MinerU Downloader 将 PDF / Word / PPT / 图片�
 
 不支持的格式：Excel（`.xls` / `.xlsx`）、HTML、纯文本、压缩包等。
 
-## 前置条件
+## 先获取工具
 
-- Python 3.10+
-- 本仓库依赖：`textual`、`requests`、`rich`、`pyyaml`、`pypdf`
+这个 skill 可以独立分发，不要求用户本机已经安装仓库。先确认用户要处理的目录（下文用 `<文档目录>` 表示），再按平台选择一种方式获取工具。
+
+### Windows：下载发布包（无需 Python，推荐）
+
+```powershell
+$AppDir = Join-Path $env:TEMP "mineru-downloader"
+$Exe = Join-Path $AppDir "mineru-downloader.exe"
+if (-not (Test-Path -LiteralPath $Exe)) {
+    $Zip = Join-Path $env:TEMP "mineru-downloader.zip"
+    Invoke-WebRequest `
+      -Uri "https://github.com/MoMoJee/MinerUDownloader/releases/latest/download/mineru-downloader.zip" `
+      -OutFile $Zip
+    Expand-Archive -LiteralPath $Zip -DestinationPath $env:TEMP -Force
+}
+cd $AppDir
+.\mineru-downloader.exe --help
+```
+
+发布包是 Windows x64；需要系统 `curl.exe`（Windows 10 / 11 自带），不需要 Python。
+
+### Windows / macOS / Linux：克隆源码
+
+PowerShell：
+
+```powershell
+$AppDir = Join-Path $env:TEMP "MinerUDownloader"
+if (-not (Test-Path -LiteralPath (Join-Path $AppDir "main.py"))) {
+    git clone --depth 1 https://github.com/MoMoJee/MinerUDownloader.git $AppDir
+}
+$PY = Join-Path $AppDir ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $PY)) {
+    python -m venv (Join-Path $AppDir ".venv")
+    & $PY -m pip install -r (Join-Path $AppDir "requirements.txt")
+}
+cd $AppDir
+& $PY main.py --help
+```
+
+bash：
+
+```bash
+APP_DIR="${TMPDIR:-/tmp}/MinerUDownloader"
+if [ ! -f "$APP_DIR/main.py" ]; then
+  git clone --depth 1 https://github.com/MoMoJee/MinerUDownloader.git "$APP_DIR"
+fi
+PY="$APP_DIR/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+  python3 -m venv "$APP_DIR/.venv"
+  "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+fi
+cd "$APP_DIR"
+"$PY" main.py --help
+```
+
+需要 Python 3.10+。如果没有 `git`，可以下载
+`https://github.com/MoMoJee/MinerUDownloader/archive/refs/heads/master.zip`，解压到 `$APP_DIR` 后继续安装依赖。
+
+### 如果已经有工具
+
+如果当前环境里已经存在本仓库或解压好的发布包，直接复用即可，不必重新下载。后面的命令默认当前目录是工具目录。
+
+## 如何获取 MinerU API Token
+
+先检查环境变量 `MINERU_TOKEN` 是否已经设置；没有就向用户索取，不要自行注册或猜测 Token。
+
+1. 打开 [mineru.net](https://mineru.net) 并注册 / 登录
+2. 进入个人中心，找到 API Token（以 `eyJ` 开头的 JWT 字符串）
+3. 通过环境变量提供给工具，避免写进命令行或提交到仓库：
+
+```powershell
+$env:MINERU_TOKEN = "eyJ..."
+```
+
+```bash
+export MINERU_TOKEN="eyJ..."
+```
+
+Token 有时效性，失效后 HTTP 401 / `A0202` / `A0211`，需要重新获取。
+
+## 运行要求
+
+- Python 3.10+（仅源码方式）
+- 工具依赖：`textual`、`requests`、`rich`、`pyyaml`、`pypdf`
 - 实际提交任务时需要 `curl` / `curl.exe` 在 `PATH` 中（`--dry-run` 不需要）
-- 一个 MinerU API Token（以 `eyJ` 开头的 JWT，从 [mineru.net](https://mineru.net) 个人中心获取）
+- 一个 MinerU API Token（以 `eyJ` 开头的 JWT）
 - 能访问 `mineru.net` 与阿里云 OSS
-
-优先使用仓库自带的虚拟环境：
-
-```powershell
-# Windows PowerShell
-cd <仓库根目录>   # 本文件位于 <仓库根目录>/skills/skill.md
-.\.venv\Scripts\python.exe -c "import rich, requests, yaml, pypdf; print('deps ok')"
-```
-
-```bash
-# macOS / Linux
-cd /path/to/MinerUDownloader
-.venv/bin/python -c "import rich, requests, yaml, pypdf; print('deps ok')"
-```
-
-如果依赖缺失：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\pip.exe install -r requirements.txt
-```
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
 
 下文用 `$PY` 表示解释器：
 
 - Windows PowerShell：`$PY = ".\.venv\Scripts\python.exe"`
 - bash：`PY=".venv/bin/python"`
+
+如果使用发布包，把命令中的 `$PY main.py` 替换为 `.\mineru-downloader.exe`（在 `$AppDir` 下）。如果每次命令都是新 shell，先重新 `cd $AppDir`，或使用绝对路径。
 
 ## 最重要的规则
 

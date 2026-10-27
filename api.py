@@ -7,6 +7,7 @@ v2：接入 errors.py（统一错误处理）和 TokenManager（负载均衡 + �
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -95,6 +96,12 @@ def apply_upload_urls(
                 message = "所有 Token 均不可用，无法申请上传 URL"
                 if last_exc:
                     message += f"，最后错误: {last_exc}"
+                if os.environ.get("MINERU_TOKEN"):
+                    message += (
+                        "；提示：环境变量 MINERU_TOKEN 的优先级高于 mineru_config.yaml，"
+                        "若已更新配置中的 Token 仍报 401，请更新或删除该环境变量，"
+                        "或改用 --token 参数"
+                    )
                 raise RuntimeError(message) from exc
 
             headers = {
