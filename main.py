@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -301,12 +300,13 @@ def _build_parser() -> argparse.ArgumentParser:
 # ── 启动前检查 ────────────────────────────────────────────────────────────────
 
 def _check_prerequisites() -> None:
-    """检查 curl.exe 是否可用（Windows 10+ 内置）。"""
-    if shutil.which("curl.exe") is None and shutil.which("curl") is None:
+    """检查系统 curl 是否可用（Windows 10+ 内置，Linux / macOS 通常也已安装）。"""
+    from platform_utils import curl_install_hint, find_curl
+
+    if find_curl() is None:
         print(
-            "[错误] 未找到 curl / curl.exe。\n"
-            "Windows 10 / 11 已内置，请确认其在 PATH 中；\n"
-            "或从 https://curl.se/download.html 下载。",
+            "[错误] 未找到 curl 可执行文件。\n"
+            f"{curl_install_hint()}",
             file=sys.stderr,
         )
         sys.exit(1)

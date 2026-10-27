@@ -7,6 +7,7 @@ tui.py — Textual TUI 应用。
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -329,15 +330,24 @@ class FolderPickerScreen(Screen):
             lv.append(ListItem(Label("⬆  .. (上一级)")))
             self._entries.append(parent)
 
-        # —— Windows 驱动器列表（在根目录时显示）
+        # —— Windows 驱动器列表；POSIX 根目录则提供主目录快捷入口
         if parent == self._current:
-            import string
-            for letter in string.ascii_uppercase:
-                drive = Path(f"{letter}:\\")
+            if os.name == "nt":
+                import string
+                for letter in string.ascii_uppercase:
+                    drive = Path(f"{letter}:\\")
+                    try:
+                        if drive.exists():
+                            lv.append(ListItem(Label(f"💾  {letter}:\\")))
+                            self._entries.append(drive)
+                    except OSError:
+                        pass
+            else:
+                home = Path.home()
                 try:
-                    if drive.exists():
-                        lv.append(ListItem(Label(f"💾  {letter}:\\")))
-                        self._entries.append(drive)
+                    if home.exists() and home != self._current:
+                        lv.append(ListItem(Label("🏠  主目录")))
+                        self._entries.append(home)
                 except OSError:
                     pass
 
@@ -439,7 +449,8 @@ class FolderPickerScreen(Screen):
     def _goto_path(self, path_str: str) -> None:
         if not path_str:
             return
-        p = Path(path_str)
+        # 同时支持 POSIX 的 ~ 与 Windows 的用户目录展开
+        p = Path(path_str).expanduser()
         if p.exists() and self._safe_is_dir(p):
             self._current = p.resolve()
             self._refresh_list()
