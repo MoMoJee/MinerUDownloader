@@ -164,7 +164,7 @@ def build_proxies(mode: str, custom_url: str = "") -> dict[str, str] | None:
 
 def build_curl_proxy_args(mode: str, custom_url: str = "") -> list[str]:
     """
-    为 curl.exe 生成代理参数列表。
+    为 curl 生成代理参数列表。
     用于上传文件时传给 subprocess。
     """
     if mode == "custom" and custom_url:

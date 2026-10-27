@@ -1,6 +1,6 @@
 """
 api.py — MinerU 精准解析 API 封装。
-负责：申请预签名上传 URL、curl.exe 上传、批量轮询解析结果。
+负责：申请预签名上传 URL、curl 上传、批量轮询解析结果。
 
 v2：接入 errors.py（统一错误处理）和 TokenManager（负载均衡 + 自动切换）。
 """
@@ -30,6 +30,7 @@ from config import (
     build_curl_proxy_args,
 )
 from errors import ErrorCategory, MinerUApiError, NoAvailableTokenError, parse_api_response
+from platform_utils import curl_install_hint, find_curl
 from token_manager import TokenManager
 
 logger = logging.getLogger(__name__)
@@ -219,7 +220,7 @@ def apply_upload_urls(
             return batch_id, upload_urls, token_idx
 
 
-# ── curl.exe 上传 ─────────────────────────────────────────────────────────────
+# ── curl 上传 ─────────────────────────────────────────────────────────────────
 
 def upload_file_curl(
     local_path: Path,
@@ -228,15 +229,26 @@ def upload_file_curl(
     proxy_url: str = "",
 ) -> bool:
     """
-    用 curl.exe 将本地文件上传到 OSS 预签名 URL。
+    用系统 curl 将本地文件上传到 OSS 预签名 URL。
     规避 Python requests 在 Windows 上对阿里云 OSS 的 SSLEOFError。
     返回 True 表示成功。
     """
+    curl = find_curl()
+    if curl is None:
+        raise RuntimeError(f"未找到 curl 可执行文件。\n{curl_install_hint()}")
+
     proxy_args = build_curl_proxy_args(proxy_mode, proxy_url)
-    cmd = ["curl.exe", "-s", "-S", "-X", "PUT", "-T", str(local_path)] + proxy_args + [upload_url]
+    cmd = [curl, "-s", "-S", "-X", "PUT", "-T", str(local_path)] + proxy_args + [upload_url]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
         if result.returncode != 0:
             logger.warning("curl 上传失败 %s: returncode=%d stderr=%s",
                            local_path.name, result.returncode, result.stderr[:200])
@@ -251,9 +263,7 @@ def upload_file_curl(
         logger.warning("curl 上传超时: %s", local_path.name)
         return False
     except FileNotFoundError:
-        raise RuntimeError(
-            "未找到 curl.exe。请确认已安装 curl（Windows 10+ 内置）或将其加入 PATH。"
-        )
+        raise RuntimeError(f"未找到 curl 可执行文件。\n{curl_install_hint()}")
 
 
 def upload_batch_concurrent(

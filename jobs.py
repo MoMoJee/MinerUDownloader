@@ -6,7 +6,6 @@ jobs.py — 一次性 CLI 的后台作业管理。
 """
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import re
@@ -80,6 +79,8 @@ def _pid_alive(pid: int) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
     if os.name == "nt":
+        import ctypes
+
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.restype = ctypes.c_void_p
         kernel32.OpenProcess.argtypes = [

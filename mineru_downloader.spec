@@ -2,24 +2,36 @@
 """
 PyInstaller spec — MinerU 批量解析下载工具
 打包为单目录（onedir）可执行文件，保留 console 窗口（TUI/CLI 均需要）。
+Windows 与 Linux / macOS 通用：请在目标平台上分别执行打包。
 """
 
-import os
+import sys
 from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
 # ── 项目根目录 ────────────────────────────────────────────────────────────────
 ROOT = Path(SPECPATH)
 
+# textual 的数据文件跟随当前 Python 环境的安装位置，避免硬编码 Windows 的
+# .venv/Lib/... 或 Linux 的 .venv/lib/... 路径。
+datas = collect_data_files("textual")
+
+# 图标仅在对应平台支持时传入：Windows 用 .ico，macOS 用 .icns。
+if sys.platform == "win32":
+    icon = str(ROOT / "logo.ico")
+elif sys.platform == "darwin" and (ROOT / "logo.icns").exists():
+    icon = str(ROOT / "logo.icns")
+else:
+    icon = None
+
 a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[
-        # textual 内置主题 / 字体等（若有）
-        (str(ROOT / '.venv/Lib/site-packages/textual'), 'textual'),
-    ],
+    datas=datas,
     hiddenimports=[
         # textual 动态导入的 widget 模块
         'textual',
@@ -65,6 +77,7 @@ a = Analysis(
         'pathlib',
         'yaml',
         'jobs',
+        'platform_utils',
         # urllib3 / requests 依赖的标准库（不能放进 excludes）
         'email',
         'email.message',
@@ -120,7 +133,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(ROOT / 'logo.ico'),
+    icon=icon,
 )
 
 coll = COLLECT(

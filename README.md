@@ -29,9 +29,21 @@
 ### 1. 环境要求
 
 - Python 3.10+
-- Windows 10 / 11（需要内置 `curl.exe`，用于规避 Windows 上阿里云 OSS 的 SSL 问题）
+- Windows 10 / 11、Linux 或 macOS
+- 系统 `curl`：Windows 10 / 11 内置 `curl.exe`，Linux / macOS 通常已预装（缺失时见下方安装提示）
 
-> macOS / Linux 可用，但 OSS 上传回退到 `curl` 命令，需确保已安装。
+> OSS 上传统一通过系统 `curl` 完成，用于规避 Windows 上阿里云 OSS 的 SSL 问题；程序会自动查找 `curl.exe` / `curl`。
+
+Linux 安装 curl：
+
+```bash
+# Debian / Ubuntu
+sudo apt install curl
+# Fedora
+sudo dnf install curl
+# Arch Linux
+sudo pacman -S curl
+```
 
 ### 2. 安装依赖
 
@@ -320,13 +332,15 @@ MinerUDownloader/
 | `pyyaml >= 6.0.0` | 配置文件读写 |
 | `pypdf >= 4.0.0` | 超页 PDF 自动拆分 |
 
-系统依赖：`curl.exe`（Windows 10 / 11 内置）
+系统依赖：`curl`（Windows 10 / 11 内置 `curl.exe`；Linux / macOS 通常预装）
 
 ---
 
-## 打包为 Windows 可执行文件
+## 打包为可执行文件（Windows / Linux / macOS）
 
-项目提供 `mineru_downloader.spec`，可用 PyInstaller 打包为免安装 Python 的独立程序。
+项目提供跨平台的 `mineru_downloader.spec`，可在目标平台上用 PyInstaller 打包为免安装 Python 的独立程序。
+
+> PyInstaller 不支持交叉编译：在 Windows 上打包得到 Windows 版，在 Linux 上打包得到 Linux 版。
 
 ### 步骤
 
@@ -341,24 +355,30 @@ pyinstaller --clean -y mineru_downloader.spec
 pyinstaller --clean -y mineru_downloader.spec
 ```
 
-打包完成后，输出目录为 `dist\mineru-downloader\`，直接分发整个目录即可。
+打包完成后，输出目录为 `dist/mineru-downloader/`（Windows 下为 `dist\mineru-downloader\`），直接分发整个目录即可。
 
 ### 使用打包版本
 
 ```bash
-# 将 dist\mineru-downloader\ 复制到目标机器后：
-cd mineru-downloader
+cd dist/mineru-downloader
+
+# Windows
 .\mineru-downloader.exe D:\docs
 .\mineru-downloader.exe D:\docs --cli
-.\mineru-downloader.exe --help
+
+# Linux / macOS
+./mineru-downloader /path/to/docs
+./mineru-downloader /path/to/docs --cli
+
+./mineru-downloader --help
 ```
 
-> **注意**：打包版本仍依赖系统的 `curl.exe`（Windows 10 / 11 已内置）。`mineru_config.yaml` 和后台任务目录 `.mineru_jobs/` 会在 exe 所在目录生成，首次运行需配置 Token。
+> **注意**：打包版本依赖系统的 `curl`（Windows 10 / 11 已内置）。`mineru_config.yaml` 和后台任务目录 `.mineru_jobs/` 会在可执行文件所在目录生成，首次运行需配置 Token。
 
 ### 输出说明
 
 | 路径 | 说明 |
 |------|------|
-| `dist\mineru-downloader\mineru-downloader.exe` | 主程序入口（约 6 MB）|
-| `dist\mineru-downloader\_internal\` | Python 运行时与依赖库 |
-| `build\` | 中间产物，可删除 |
+| `dist/mineru-downloader/mineru-downloader[.exe]` | 主程序入口（约 6 MB）|
+| `dist/mineru-downloader/_internal/` | Python 运行时与依赖库 |
+| `build/` | 中间产物，可删除 |
