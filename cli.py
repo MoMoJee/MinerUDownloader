@@ -772,7 +772,7 @@ def _phase_process(
 ) -> dict:
     """提交、轮询、下载，展示进度并返回结构化汇总。"""
     from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
-    from processor import download_results_concurrent
+    from processor import EagerDownloader
 
     state = _CliProgressState()
     to_process = [f for f in selected if f.duplicate_action != DuplicateAction.SKIP]
@@ -870,9 +870,35 @@ def _phase_process(
                             state.failed += 1
                         progress.advance(upload_task)
 
-        # ── 轮询 ──
+        # ── 轮询（解析完成立即投递下载） ──
         progress.update(parse_task, description="解析中")
         state.log_line("轮询解析结果中...")
+
+        def on_dl(fn: FileNode, md_path, err: str | None) -> None:
+            if md_path:
+                state.set(fn, "done", f"→ {md_path.name}")
+                state.file_output[fn] = str(md_path)
+                with state.lock:
+                    state.done += 1
+                state.log_line(f"[完成] {fn.path.name} → {md_path.name}")
+            else:
+                state.set(fn, "failed", f"下载失败: {err}")
+                with state.lock:
+                    state.failed += 1
+                state.log_line(f"[失败] 下载 {fn.path.name}: {err}")
+            progress.advance(dl_task)
+
+        downloader = EagerDownloader(keep_zip, keep_json, proxies, on_dl)
+        terminal_lock = threading.Lock()
+        parse_terminal: set[FileNode] = set()
+
+        def _first_terminal(fn: FileNode) -> bool:
+            """同一文件只处理一次终态，避免重复回调重复计数/重复下载。"""
+            with terminal_lock:
+                if fn in parse_terminal:
+                    return False
+                parse_terminal.add(fn)
+                return True
 
         def on_bp(bid: str, results: list[dict]) -> None:
             nodes = batch_node_map.get(bid, [])
@@ -887,9 +913,16 @@ def _phase_process(
                     state.set(fn, "parsing",
                                f"解析中 ({prog.get('extracted_pages','?')}/{prog.get('total_pages','?')} 页)")
                 elif s == "done":
+                    if not _first_terminal(fn):
+                        continue
                     state.set(fn, "dl-ready", "准备下载")
                     progress.advance(parse_task)
+                    zip_url = r.get("full_zip_url", "")
+                    if zip_url:
+                        downloader.submit(zip_url, fn, stem_map[fn])
                 elif s == "failed":
+                    if not _first_terminal(fn):
+                        continue
                     if "number of pages exceeds limit" in r.get("err_msg", ""):
                         state.set(fn, "parsing", "超页，准备自动拆分...")
                     else:
@@ -927,37 +960,17 @@ def _phase_process(
                 proxy_mode, proxy_url, state, progress, dl_task,
             )
 
-        # ── 下载 ──
+        # ── 下载兜底：回调遗漏的已完成文件统一补投，然后等待全部下载结束 ──
         progress.update(dl_task, description="下载结果")
-        download_tasks = []
         for bid, extract_results in poll_results.items():
             nodes = batch_node_map.get(bid, [])
             name_map = {fn.path.name: fn for fn in nodes}
             for r in extract_results:
                 fn = name_map.get(r.get("file_name", ""))
                 if fn and r.get("state") == "done" and r.get("full_zip_url"):
-                    download_tasks.append((r["full_zip_url"], fn, stem_map[fn]))
+                    downloader.submit(r["full_zip_url"], fn, stem_map[fn])
 
-        if download_tasks:
-            state.log_line(f"下载 {len(download_tasks)} 个结果...")
-
-            def on_dl(fn: FileNode, md_path, err: str | None) -> None:
-                if md_path:
-                    state.set(fn, "done", f"→ {md_path.name}")
-                    state.file_output[fn] = str(md_path)
-                    with state.lock:
-                        state.done += 1
-                    state.log_line(f"[完成] {fn.path.name} → {md_path.name}")
-                else:
-                    state.set(fn, "failed", f"下载失败: {err}")
-                    with state.lock:
-                        state.failed += 1
-                    state.log_line(f"[失败] 下载 {fn.path.name}: {err}")
-                progress.advance(dl_task)
-
-            download_results_concurrent(
-                download_tasks, keep_zip, keep_json, proxies, on_dl
-            )
+        downloader.wait()
 
     # ── 汇总 ──
     for fn in to_process:

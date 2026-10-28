@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -132,6 +133,79 @@ def _download_with_retry(
 
 # ── 并发下载 ──────────────────────────────────────────────────────────────────
 
+def download_result_task(
+    zip_url: str,
+    file_node,
+    output_stem: str,
+    keep_zip: bool,
+    keep_json: bool,
+    proxies: dict | None = None,
+) -> tuple:
+    """下载并解压单个文件，返回 (file_node, md_path|None, error|None)。"""
+    try:
+        md_path = extract_result(
+            zip_url, file_node.path, keep_zip, keep_json, output_stem, proxies
+        )
+        return file_node, md_path, None
+    except Exception as exc:
+        logger.error("解压失败 %s: %s", file_node.path.name, exc)
+        return file_node, None, str(exc)
+
+
+class EagerDownloader:
+    """
+    解析完成即下载的调度器：有界线程池 + 按 FileNode 去重。
+
+    on_done(file_node, md_path|None, error|None) 在下载线程中回调。
+    同一 FileNode 无论 submit 多少次都只会下载一次。
+    """
+
+    def __init__(
+        self,
+        keep_zip: bool,
+        keep_json: bool,
+        proxies: dict | None,
+        on_done: Callable,
+        max_workers: int = MAX_DOWNLOAD_WORKERS,
+    ):
+        self._keep_zip = keep_zip
+        self._keep_json = keep_json
+        self._proxies = proxies
+        self._on_done = on_done
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
+        self._lock = threading.Lock()
+        self._queued: set = set()
+
+    def submit(self, zip_url: str, file_node, output_stem: str) -> bool:
+        """投递下载；已投递过、无 URL 或池已关闭返回 False。"""
+        if not zip_url:
+            return False
+        with self._lock:
+            if file_node in self._queued:
+                return False
+            self._queued.add(file_node)
+        try:
+            future = self._pool.submit(
+                download_result_task,
+                zip_url, file_node, output_stem,
+                self._keep_zip, self._keep_json, self._proxies,
+            )
+        except RuntimeError:
+            with self._lock:
+                self._queued.discard(file_node)
+            return False
+        future.add_done_callback(self._handle_done)
+        return True
+
+    def _handle_done(self, future) -> None:
+        fn, md_path, err = future.result()
+        self._on_done(fn, md_path, err)
+
+    def wait(self) -> None:
+        """等待所有已投递的下载完成并关闭线程池。"""
+        self._pool.shutdown(wait=True)
+
+
 def download_results_concurrent(
     tasks: list[tuple],   # [(zip_url, file_node, output_stem), ...]
     keep_zip: bool,
@@ -149,14 +223,9 @@ def download_results_concurrent(
     results: dict = {}
 
     def _process(zip_url: str, fn, stem: str):
-        try:
-            md_path = extract_result(
-                zip_url, fn.path, keep_zip, keep_json, stem, proxies
-            )
-            return fn, md_path, None
-        except Exception as exc:
-            logger.error("解压失败 %s: %s", fn.path.name, exc)
-            return fn, None, str(exc)
+        return download_result_task(
+            zip_url, fn, stem, keep_zip, keep_json, proxies
+        )
 
     with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
         futures = {

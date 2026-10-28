@@ -1003,8 +1003,17 @@ class ProgressScreen(Screen):
         self._start_time = time.monotonic()
         self._done_count = 0
         self._fail_count = 0
+        self._counter_lock = threading.Lock()
         self._total = len(file_nodes)
         self._finished = False
+
+    def _mark_done(self) -> None:
+        with self._counter_lock:
+            self._done_count += 1
+
+    def _mark_failed(self) -> None:
+        with self._counter_lock:
+            self._fail_count += 1
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1095,7 +1104,7 @@ class ProgressScreen(Screen):
         """实际处理逻辑，由 _run_processing 包裹异常捕获。"""
         logger.debug("[_run_processing] 开始执行处理线程")
         from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
-        from processor import download_results_concurrent
+        from processor import EagerDownloader
         from scanner import DuplicateAction, resolve_output_stem
         import logging as _logging
 
@@ -1151,7 +1160,7 @@ class ProgressScreen(Screen):
                     else:
                         self._statuses[fn_match] = FileStatus.FAILED
                         self._messages[fn_match] = "上传失败"
-                        self._fail_count += 1
+                        self._mark_failed()
                         self._log_line(f"[失败] 上传 {path.name}")
                         _logging.getLogger("app").error(
                             "file=%s stage=upload msg=上传失败", path
@@ -1180,15 +1189,39 @@ class ProgressScreen(Screen):
                     if self._statuses[fn] == FileStatus.UPLOADING:
                         self._statuses[fn] = FileStatus.FAILED
                         self._messages[fn] = f"失败: {exc}"
-                        self._fail_count += 1
+                        self._mark_failed()
 
         if not batch_node_map:
             self._finished = True
             self._log_line("所有文件均上传失败，处理终止")
             return
 
-        # ── 轮询阶段 ──
+        # ── 轮询阶段（解析完成立即投递下载） ──
         self._log_line("开始轮询解析结果...")
+
+        def _on_downloaded(fn: FileNode, md_path, err: str | None) -> None:
+            if md_path:
+                self._statuses[fn] = FileStatus.DONE
+                self._messages[fn] = f"✓ → {md_path.name}"
+                self._mark_done()
+                self._log_line(f"[完成] {fn.path.name} → {md_path.name}")
+            else:
+                self._statuses[fn] = FileStatus.FAILED
+                self._messages[fn] = f"下载失败: {err}"
+                self._mark_failed()
+                self._log_line(f"[失败] 下载 {fn.path.name}: {err}")
+
+        downloader = EagerDownloader(keep_zip, keep_json, proxies, _on_downloaded)
+
+        def _submit_download(zip_url: str, fn: FileNode) -> None:
+            if not zip_url:
+                return
+            if self._statuses.get(fn) in (FileStatus.DONE, FileStatus.FAILED):
+                return
+            # 先置状态再投递，避免下载极快完成时被这里覆盖回“下载中”
+            self._statuses[fn] = FileStatus.DOWNLOADING
+            self._messages[fn] = "下载中..."
+            downloader.submit(zip_url, fn, stem_map[fn])
 
         # 建立 file_name → FileNode 映射（同批）
         def on_batch_progress(bid: str, results: list[dict]) -> None:
@@ -1208,9 +1241,12 @@ class ProgressScreen(Screen):
                 elif state == "pending":
                     self._messages[fn] = "排队中"
                 elif state == "done":
-                    if self._statuses[fn] != FileStatus.DONE:
+                    if self._statuses.get(fn) not in (
+                        FileStatus.DONE, FileStatus.DOWNLOADING, FileStatus.FAILED
+                    ):
                         self._statuses[fn] = FileStatus.DOWNLOADING
                         self._messages[fn] = "准备下载"
+                    _submit_download(r.get("full_zip_url", ""), fn)
                 elif state == "failed":
                     if self._statuses[fn] != FileStatus.FAILED:
                         if "number of pages exceeds limit" in r.get("err_msg", ""):
@@ -1219,7 +1255,7 @@ class ProgressScreen(Screen):
                         else:
                             self._statuses[fn] = FileStatus.FAILED
                             self._messages[fn] = f"解析失败: {r.get('err_msg', '')}"
-                            self._fail_count += 1
+                            self._mark_failed()
                             self._log_line(f"[失败] {fn.path.name}: {r.get('err_msg', '')}")
 
         batch_token_pairs = [(bid, batch_token_idx.get(bid, 0)) for bid in batch_node_map]
@@ -1258,40 +1294,16 @@ class ProgressScreen(Screen):
             # 更新失败计数（已被 _handle_overlimit_files 内部修改）
             pass
 
-        # ── 下载阶段 ──
-        download_tasks = []
+        # ── 下载兜底：回调遗漏的已完成文件补投，然后等待全部下载结束 ──
         for bid, extract_results in poll_results.items():
             nodes = batch_node_map.get(bid, [])
             name_map = {fn.path.name: fn for fn in nodes}
             for r in extract_results:
                 fn = name_map.get(r.get("file_name", ""))
-                if fn is None or r.get("state") != "done":
-                    continue
-                # 如果已被拆分处理，跳过（状态已被更新为 DONE 或 FAILED）
-                if self._statuses.get(fn) in (FileStatus.DONE, FileStatus.FAILED) and fn in overlimit_nodes:
-                    continue
-                zip_url = r.get("full_zip_url", "")
-                if zip_url:
-                    download_tasks.append((zip_url, fn, stem_map[fn]))
+                if fn and r.get("state") == "done":
+                    _submit_download(r.get("full_zip_url", ""), fn)
 
-        if download_tasks:
-            self._log_line(f"开始下载 {len(download_tasks)} 个结果...")
-
-            def on_downloaded(fn: FileNode, md_path, err: str | None) -> None:
-                if md_path:
-                    self._statuses[fn] = FileStatus.DONE
-                    self._messages[fn] = f"✓ → {fn.path.stem}.md"
-                    self._done_count += 1
-                    self._log_line(f"[完成] {fn.path.name} → {md_path.name}")
-                else:
-                    self._statuses[fn] = FileStatus.FAILED
-                    self._messages[fn] = f"下载失败: {err}"
-                    self._fail_count += 1
-                    self._log_line(f"[失败] 下载 {fn.path.name}: {err}")
-
-            download_results_concurrent(
-                download_tasks, keep_zip, keep_json, proxies, on_downloaded
-            )
+        downloader.wait()
 
         self._finished = True
         self._log_line(
@@ -1329,7 +1341,7 @@ class ProgressScreen(Screen):
             for fn in nodes:
                 self._statuses[fn] = FileStatus.FAILED
                 self._messages[fn] = "需要 pypdf 拆分但未安装，请 pip install pypdf"
-                self._fail_count += 1
+                self._mark_failed()
             return
 
         from api import build_batches, submit_and_upload_batch, poll_batches_concurrent
@@ -1348,7 +1360,7 @@ class ProgressScreen(Screen):
             except Exception as exc:
                 self._statuses[fn] = FileStatus.FAILED
                 self._messages[fn] = f"读取 PDF 失败: {exc}"
-                self._fail_count += 1
+                self._mark_failed()
                 self._log_line(f"[失败] {fn.path.name} 读取失败: {exc}")
                 continue
 
@@ -1375,7 +1387,7 @@ class ProgressScreen(Screen):
             except Exception as exc:
                 self._statuses[fn] = FileStatus.FAILED
                 self._messages[fn] = f"拆分失败: {exc}"
-                self._fail_count += 1
+                self._mark_failed()
                 self._log_line(f"[失败] {fn.path.name} 拆分失败: {exc}")
                 _cleanup_dir(tmpdir)
                 continue
@@ -1418,7 +1430,7 @@ class ProgressScreen(Screen):
             if not upload_ok or not chunk_batch_map:
                 self._statuses[fn] = FileStatus.FAILED
                 self._messages[fn] = "分片上传失败"
-                self._fail_count += 1
+                self._mark_failed()
                 _cleanup_dir(tmpdir)
                 continue
 
@@ -1516,7 +1528,7 @@ class ProgressScreen(Screen):
             if not ordered_mds:
                 self._statuses[fn] = FileStatus.FAILED
                 self._messages[fn] = "所有分片下载均失败"
-                self._fail_count += 1
+                self._mark_failed()
                 self._log_line(f"[失败] {fn.path.name} 所有分片均失败")
                 _cleanup_dir(tmpdir)
                 continue
@@ -1534,12 +1546,12 @@ class ProgressScreen(Screen):
                 out_md.write_text(combined, encoding="utf-8")
                 self._statuses[fn] = FileStatus.DONE
                 self._messages[fn] = f"✓ 拆分合并 → {out_md.name}"
-                self._done_count += 1
+                self._mark_done()
                 self._log_line(f"[完成] {fn.path.name} 拆分合并完成 → {out_md.name}（{len(ordered_mds)}/{len(chunk_paths)} 片）")
             except OSError as exc:
                 self._statuses[fn] = FileStatus.FAILED
                 self._messages[fn] = f"写入合并 .md 失败: {exc}"
-                self._fail_count += 1
+                self._mark_failed()
                 self._log_line(f"[失败] {fn.path.name} 写入合并 .md 失败: {exc}")
 
             _cleanup_dir(tmpdir)
